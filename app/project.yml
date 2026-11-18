@@ -1,0 +1,92 @@
+name: PiMobile
+options:
+  bundleIdPrefix: dev.example
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    PI_MOBILE_BUNDLE_ID: dev.example.pimobile
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+packages:
+  PiMobileCore:
+    path: Packages/PiMobileCore
+
+targets:
+  PiMobileLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - PiMobileLiveActivity
+      - PiMobile/LiveActivity/SessionActivityAttributes.swift
+    info:
+      path: PiMobileLiveActivity/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: Pi Mobile 实时活动
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PI_MOBILE_BUNDLE_ID).liveactivity
+        SKIP_INSTALL: YES
+        SWIFT_VERSION: "5"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+
+  PiMobile:
+    type: application
+    platform: iOS
+    sources: [PiMobile]
+    dependencies:
+      - package: PiMobileCore
+      - target: PiMobileLiveActivity
+        embed: true
+    entitlements:
+      path: PiMobile/PiMobile.entitlements
+    info:
+      path: PiMobile/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: Pi Mobile
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: 扫描 Mac 端 gateway 显示的配对二维码
+        ITSAppUsesNonExemptEncryption: false
+        NSSupportsLiveActivities: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PI_MOBILE_BUNDLE_ID)
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_PREVIEWS: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  PiMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [PiMobileTests]
+    dependencies:
+      - target: PiMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PI_MOBILE_BUNDLE_ID).tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5"
+
+schemes:
+  PiMobile:
+    build:
+      targets:
+        PiMobile: all
+    test:
+      targets: [PiMobileTests]

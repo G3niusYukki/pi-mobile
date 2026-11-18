@@ -1,0 +1,17 @@
+{
+  "name": "pi-mobile-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi Mobile 中转：只做鉴权、配对与消息路由，不存会话内容",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/relay.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

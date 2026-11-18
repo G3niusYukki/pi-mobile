@@ -1,0 +1,320 @@
+import Foundation
+import Combine
+
+@MainActor
+public final class RelayClient: ObservableObject {
+    @Published public private(set) var state: ConnectionState = .idle
+    @Published public private(set) var lastError: String?
+
+    public var onEvent: (([String: Any]) -> Void)?
+    public var onResponse: (([String: Any]) -> Void)?
+    public var onPaired: ((String) -> Void)?
+    public var onDeviceStatus: ((Bool) -> Void)?
+    public var onSessionList: (([[String: Any]]) -> Void)?
+
+    public var isConnected: Bool { state == .paired || state == .running }
+
+    public var hasPairing: Bool { store.restore() != nil }
+
+    private enum Handshake {
+        case pair(PairingLink)
+        case resume(token: String, key: E2EKey)
+    }
+
+    private let configuredEndpoint: URL?
+    private let store: PairingStore
+    private let makeSocket: (URLRequest) -> any RelaySocket
+    private var socket: (any RelaySocket)?
+    private var receiver: Task<Void, Never>?
+    private var handshake: Handshake?
+    private var e2e: E2EKey?  // Only set after this socket's handshake completes.
+    private var reconnectDelay: UInt64 = 1_000_000_000
+
+    public convenience init(endpoint: String? = nil) {
+        self.init(endpoint: endpoint, store: .keychain) { RelaySession.shared.webSocketTask(with: $0) }
+    }
+
+    init(endpoint: String?, store: PairingStore, makeSocket: @escaping (URLRequest) -> any RelaySocket) {
+        self.configuredEndpoint = endpoint.flatMap { URL(string: $0, encodingInvalidCharacters: false) }
+        self.store = store
+        self.makeSocket = makeSocket
+    }
+
+    public func connect() {
+        disconnect()
+        guard let saved = store.restore() else {
+            fail(PairingLink.Failure.missingRelay.localizedDescription)
+            return
+        }
+        handshake = .resume(token: saved.token, key: saved.key)
+        open(endpoint: saved.endpoint, authorization: saved.token)
+    }
+
+    /// 仅在尚未建连时重连，避免 scenePhase 反复触发时踢掉自己。
+    public func connectIfNeeded() {
+        guard !isConnected, state != .connecting else { return }
+        connect()
+    }
+
+    public func pair(token: String) {
+        let link: PairingLink
+        do { link = try PairingLink(token, knownEndpoint: configuredEndpoint ?? store.restore()?.endpoint) }
+        catch {
+            if isConnected { lastError = error.localizedDescription }
+            else { fail(error.localizedDescription) }
+            return
+        }
+        disconnect()
+        handshake = .pair(link)
+        open(endpoint: link.endpoint, authorization: nil)
+    }
+
+    public func resetPairing() {
+        disconnect()
+        store.clear()
+        lastError = nil
+    }
+
+    public func send(_ object: [String: Any]) async throws {
+        guard let socket, e2e != nil else { throw ClientError.notConnected }
+        var wire = object
+        if let type = object["type"] as? String, type == "rpc" || type == "extension_ui_response" {
+            let payload: [String: Any] = type == "rpc" ? ["command": object["command"] as Any] : object
+            guard let sealed = e2e?.seal(payload) else { throw ClientError.missingKey }
+            wire = ["type": type, "id": object["id"] as Any, "sealed": sealed]
+        }
+        try await sendWire(wire, on: socket)
+    }
+
+    private func sendWire(_ object: [String: Any], on task: any RelaySocket) async throws {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        try await task.send(.string(String(decoding: data, as: UTF8.self)))
+    }
+
+    public func requestSessions() {
+        Task { try? await send(["type": "session_list"]) }
+    }
+
+    public func switchSession(path: String) {
+        Task { try? await send(["type": "session_switch", "sessionPath": path]) }
+    }
+
+    public func newSession() {
+        Task { try? await send(["type": "session_new"]) }
+    }
+
+    public func disconnect() {
+        receiver?.cancel()
+        receiver = nil
+        socket?.cancel(with: .normalClosure, reason: nil)
+        socket = nil
+        handshake = nil
+        e2e = nil
+        state = .idle
+    }
+
+    private func fail(_ message: String) {
+        disconnect()
+        lastError = message
+        state = .error
+    }
+
+    private func open(endpoint: URL, authorization: String?) {
+        var request = URLRequest(url: endpoint)
+        if let token = authorization {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        lastError = nil
+        state = .connecting
+        let task = makeSocket(request)
+        socket = task
+        task.resume()
+        receiver = Task { [weak self] in
+            guard let self, !Task.isCancelled, self.socket === task else { return }
+            if case let .pair(link) = self.handshake {
+                do { try await self.sendWire(["type": "pair", "token": link.code, "pub": link.key.publicKey], on: task) }
+                catch {
+                    if self.socket === task { self.fail(error.localizedDescription) }
+                    return
+                }
+            }
+            await self.receiveLoop(task)
+        }
+    }
+
+    private func receiveLoop(_ task: any RelaySocket) async {
+        while !Task.isCancelled {
+            do {
+                let message = try await task.receive()
+                guard !Task.isCancelled, socket === task else { return }
+                let text: String
+                switch message {
+                case .string(let value): text = value
+                case .data(let data): text = String(data: data, encoding: .utf8) ?? ""
+                @unknown default: continue
+                }
+                guard let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { continue }
+                await handle(object, from: task)
+            } catch {
+                guard !Task.isCancelled, socket === task else { return }
+                if case .pair = handshake {
+                    fail(error.localizedDescription)
+                    return
+                }
+                lastError = error.localizedDescription
+                state = .error
+                break
+            }
+        }
+        guard !Task.isCancelled, socket === task else { return }
+        let delay = reconnectDelay
+        reconnectDelay = min(reconnectDelay * 2, 30_000_000_000)
+        do { try await Task.sleep(nanoseconds: delay) }
+        catch { return }
+        guard !Task.isCancelled, socket === task else { return }
+        connect()
+    }
+
+    private func finishHandshake(token: String?, on task: any RelaySocket) async {
+        guard socket === task, let handshake else { return }
+        guard let token, PairingLink.isHex(token, length: 64) else {
+            fail("中继返回的配对凭据无效")
+            return
+        }
+        let key: E2EKey
+        switch handshake {
+        case .pair(let link): key = link.key
+        case .resume(let expected, let savedKey):
+            guard token == expected else { fail("中继返回了不同的配对凭据"); return }
+            key = savedKey
+        }
+        // A restarted gateway needs the same public key again for its E2E handshake.
+        do { try await sendWire(["type": "pair_pub", "pub": key.publicKey], on: task) }
+        catch {
+            if socket === task { fail(error.localizedDescription) }
+            return
+        }
+        guard socket === task, !Task.isCancelled else { return }
+        if case .pair(let link) = handshake, !store.save(endpoint: link.endpoint, token: token, key: key) {
+            fail("无法保存配对凭据，请重新配对")
+            return
+        }
+        self.handshake = nil
+        e2e = key
+        state = .paired
+        reconnectDelay = 1_000_000_000
+        onPaired?(token)
+    }
+
+    func handle(_ object: [String: Any]) async {
+        guard let socket else { return }
+        await handle(object, from: socket)
+    }
+
+    private func handle(_ object: [String: Any], from task: any RelaySocket) async {
+        guard socket === task, let type = object["type"] as? String else { return }
+        if type == "paired" {
+            await finishHandshake(token: object["deviceToken"] as? String, on: task)
+            return
+        }
+        if type == "error", handshake != nil {
+            fail(object["message"] as? String ?? "配对失败")
+            return
+        }
+        guard e2e != nil else { return }
+        switch type {
+        case "status":
+            if object["needsPairingKey"] as? Bool == true {
+                connect()
+                return
+            }
+            if (object["state"] as? String) == "unknown" {
+                lastError = "Mac gateway 离线"
+                state = .error
+            } else {
+                state = (object["state"] as? String) == "running" ? .running : .paired
+            }
+        case "event":
+            guard let sealed = object["sealed"] as? String, let event = e2e?.open(sealed) else { return }
+            onEvent?(event)
+        case "rpc_response":
+            guard let sealed = object["sealed"] as? String, let response = e2e?.open(sealed) else { return }
+            onResponse?(response)
+        case "device_status":
+            onDeviceStatus?(object["online"] as? Bool == true)
+        case "session_list":
+            onSessionList?(object["sessions"] as? [[String: Any]] ?? [])
+        case "error":
+            lastError = object["message"] as? String
+            state = .error
+        default:
+            break
+        }
+    }
+
+    public enum ClientError: Error {
+        case notConnected, missingKey
+    }
+}
+
+@MainActor
+protocol RelaySocket: AnyObject {
+    func resume()
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+    func send(_ message: URLSessionWebSocketTask.Message) async throws
+    func receive() async throws -> URLSessionWebSocketTask.Message
+}
+
+extension URLSessionWebSocketTask: RelaySocket {}
+
+private final class RelaySession: NSObject, URLSessionTaskDelegate {
+    static let shared: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
+        config.urlCredentialStorage = nil
+        return URLSession(configuration: config, delegate: RelaySession(), delegateQueue: nil)
+    }()
+
+    // Both the bearer and the first pairing frame belong to exactly one origin.
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+struct PairingStore {
+    let read: () -> String?
+    let write: (String) -> Bool
+    let clear: () -> Void
+
+    private static let recordKey = "pi-mobile.pairing.v1"
+    static let keychain = PairingStore(
+        read: { KeychainStore.read(recordKey) },
+        write: { KeychainStore.write($0, key: recordKey) },
+        clear: {
+            for key in [recordKey, "pi-mobile.deviceToken", "pi-mobile.e2ePriv", "pi-mobile.gatewayPub"] {
+                KeychainStore.delete(key)
+            }
+        }
+    )
+
+    private struct Record: Codable {
+        let endpoint: URL
+        let token: String
+        let privateKey: String
+        let gatewayKey: String
+    }
+
+    func restore() -> (endpoint: URL, token: String, key: E2EKey)? {
+        guard let text = read(), let record = try? JSONDecoder().decode(Record.self, from: Data(text.utf8)),
+              PairingLink.isClientEndpoint(record.endpoint), PairingLink.isHex(record.token, length: 64),
+              let key = E2EKey(privateKeyBase64Url: record.privateKey, gatewayPublicKey: record.gatewayKey) else { return nil }
+        return (record.endpoint, record.token, key)
+    }
+
+    func save(endpoint: URL, token: String, key: E2EKey) -> Bool {
+        let record = Record(endpoint: endpoint, token: token, privateKey: key.privateRaw, gatewayKey: key.gatewayPublic)
+        guard let data = try? JSONEncoder().encode(record) else { return false }
+        return write(String(decoding: data, as: UTF8.self))
+    }
+}
