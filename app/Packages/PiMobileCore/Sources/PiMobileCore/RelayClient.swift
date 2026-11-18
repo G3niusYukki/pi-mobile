@@ -311,21 +311,45 @@ struct PairingStore {
     let clear: () -> Void
 
     private static let recordKey = "pi-mobile.pairing.v1"
-    static let keychain = PairingStore(
-        read: { KeychainStore.read(recordKey) },
-        write: { KeychainStore.write($0, key: recordKey) },
-        clear: {
-            for key in [recordKey, "pi-mobile.deviceToken", "pi-mobile.e2ePriv", "pi-mobile.gatewayPub"] {
-                KeychainStore.delete(key)
-            }
-        }
+    static let keychain = accounts(
+        legacyEndpoint: Bundle.main.object(forInfoDictionaryKey: "PiMobileLegacyRelayEndpoint") as? String,
+        read: KeychainStore.read, write: KeychainStore.write, insert: KeychainStore.insert,
+        delete: { KeychainStore.delete($0) }
     )
+
+    static func accounts(legacyEndpoint: String?, read: @escaping (String) -> String?,
+                         write: @escaping (String, String) -> Bool, insert: @escaping (String, String) -> Bool,
+                         delete: @escaping (String) -> Void) -> PairingStore {
+        PairingStore(read: {
+            if let current = read(recordKey) { return current }
+            // The old build stored no origin. Only its fixed relay, supplied by the signer, can own these credentials.
+            guard let legacyEndpoint, let endpoint = URL(string: legacyEndpoint, encodingInvalidCharacters: false),
+                  PairingLink.isClientEndpoint(endpoint),
+                  let token = read("pi-mobile.deviceToken"), PairingLink.isHex(token, length: 64),
+                  let privateKey = read("pi-mobile.e2ePriv"), let gatewayKey = read("pi-mobile.gatewayPub"),
+                  let key = E2EKey(privateKeyBase64Url: privateKey, gatewayPublicKey: gatewayKey),
+                  let text = Record(endpoint: endpoint, token: token, privateKey: key.privateRaw, gatewayKey: key.gatewayPublic).encoded()
+            else { return nil }
+            // Add only: an unreadable or concurrently created current pairing must never be replaced.
+            _ = insert(text, recordKey)
+            return read(recordKey)
+        }, write: { write($0, recordKey) }, clear: {
+            for key in [recordKey, "pi-mobile.deviceToken", "pi-mobile.e2ePriv", "pi-mobile.gatewayPub"] {
+                delete(key)
+            }
+        })
+    }
 
     private struct Record: Codable {
         let endpoint: URL
         let token: String
         let privateKey: String
         let gatewayKey: String
+
+        func encoded() -> String? {
+            guard let data = try? JSONEncoder().encode(self) else { return nil }
+            return String(decoding: data, as: UTF8.self)
+        }
     }
 
     func restore() -> (endpoint: URL, token: String, key: E2EKey)? {
@@ -337,7 +361,7 @@ struct PairingStore {
 
     func save(endpoint: URL, token: String, key: E2EKey) -> Bool {
         let record = Record(endpoint: endpoint, token: token, privateKey: key.privateRaw, gatewayKey: key.gatewayPublic)
-        guard let data = try? JSONEncoder().encode(record) else { return false }
-        return write(String(decoding: data, as: UTF8.self))
+        guard let text = record.encoded() else { return false }
+        return write(text)
     }
 }

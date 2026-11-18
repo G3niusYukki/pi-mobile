@@ -26,6 +26,8 @@
 	<string>扫描 Mac 端 gateway 显示的配对二维码</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
+	<key>PiMobileLegacyRelayEndpoint</key>
+	<string>$(PI_MOBILE_LEGACY_RELAY_ENDPOINT)</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

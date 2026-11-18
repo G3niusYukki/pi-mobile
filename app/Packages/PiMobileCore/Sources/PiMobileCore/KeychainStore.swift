@@ -18,12 +18,20 @@ public enum KeychainStore {
         return String(data: data, encoding: .utf8)
     }
 
+    private static func add(_ data: Data, key: String) -> OSStatus {
+        var query = baseQuery(key)
+        query[kSecValueData as String] = data
+        return SecItemAdd(query as CFDictionary, nil)
+    }
+
+    static func insert(_ value: String, key: String) -> Bool {
+        add(Data(value.utf8), key: key) == errSecSuccess
+    }
+
     @discardableResult
     public static func write(_ value: String, key: String) -> Bool {
         let data = Data(value.utf8)
-        var query = baseQuery(key)
-        query[kSecValueData as String] = data
-        let added = SecItemAdd(query as CFDictionary, nil)
+        let added = add(data, key: key)
         if added == errSecSuccess { return true }
         guard added == errSecDuplicateItem else { return false }
         return SecItemUpdate(baseQuery(key) as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecSuccess
