@@ -116,6 +116,23 @@ test("图片、空会话和只有寒暄的会话有稳定回退，结果中没�
   assert.deepEqual(await listSessionCatalog(root), rows)
 })
 
+test("Pi 附加的坐标说明不会成为话题或概要，兼容只剩文字说明的旧照片", async t => {
+  const root = fixture(t)
+  const hint = "[Image: original 2853x2007, displayed at 2000x1407. Multiply coordinates by 1.43 to map to original image.]"
+  const image = { type: "image", mimeType: "image/jpeg", data: "AAAA" }
+  const legacy = session(root, "legacy.jsonl", [header, message("u", null, "user", hint)])
+  const caption = session(root, "caption.jsonl", [header,
+    message("u", null, "user", [{ type: "text", text: `核对设置页面\n\n${hint}` }, image]),
+    message("a", "u", "assistant", "按钮颜色已调整。"),
+    message("u2", "a", "user", [{ type: "text", text: `\n\n${hint}` }, image]),
+  ])
+  const entries = await listSessionCatalog(root)
+  assert.equal(entries.find(row => row.path === legacy).title, "图片讨论")
+  assert.equal(entries.find(row => row.path === caption).title, "核对设置页面")
+  assert.equal(entries.find(row => row.path === caption).summary, "按钮颜色已调整。")
+  assert.doesNotMatch(JSON.stringify(entries), /Multiply coordinates|displayed at|original 2853|AAAA/)
+})
+
 test("跨工作目录选最近 50 条并限制读取，无视软链接和非会话文件", async t => {
   const root = fixture(t)
   const outside = fixture(t)

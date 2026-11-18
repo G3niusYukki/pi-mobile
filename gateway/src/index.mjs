@@ -7,7 +7,7 @@ import { env } from "node:process"
 import QRCode from "qrcode"
 import WebSocket from "ws"
 import { agree, gatewayPublicKey, hasSessionKey, open, seal } from "./crypto.mjs"
-import { readSessionHistoryStrict } from "./history.mjs"
+import { MAX_ATTACHMENT_BYTES, projectUserContent, readSessionHistoryStrict } from "./history.mjs"
 import { listSessionCatalog } from "./session-catalog.mjs"
 
 // 令牌从同目录 .env 读取，不进命令行历史。
@@ -27,7 +27,6 @@ const PI_CWD = env.PI_CWD ?? process.cwd()
 const PI_ARGS = (env.PI_ARGS ?? "--mode rpc").split(/\s+/).filter(Boolean)
 const PAIR_BASE = env.PAIR_BASE ?? ""
 const SESSION_DIR = env.PI_SESSION_DIR ?? join(homedir(), ".pi/agent/sessions")
-const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024
 
 if (!TOKEN) {
   console.error("缺少 GATEWAY_TOKEN")
@@ -66,12 +65,19 @@ function phoneContent(content) {
 function phoneMessage(message) {
   if (!message) return undefined
   const { role, toolCallId, toolName } = message
+  if (role === "user") {
+    const { text, attachments } = projectUserContent(message.content)
+    if (attachments.length) return { role, content: [...(text ? [{ type: "text", text }] : []), ...attachments] }
+  }
   return { role, toolCallId, toolName, content: phoneContent(message.content) }
 }
 function phoneEvent(event) {
   const { type, sessionPath } = event
   if (type === "message_update") {
     const update = event.assistantMessageEvent
+    // Only the transition crosses the wire. The partial snapshot and token deltas stay on the Mac.
+    if (update?.type === "thinking_start") return { type: "run_phase", phase: "thinking", sessionPath }
+    if (update?.type === "toolcall_start") return { type: "run_phase", phase: "preparing_tool", sessionPath }
     if (!["text_start", "text_delta", "text_end"].includes(update?.type)) return null
     return { type, sessionPath, message: phoneMessage(event.message ?? update.partial),
       assistantMessageEvent: { type: update.type, delta: update.type === "text_delta" ? update.delta : undefined } }
@@ -81,8 +87,8 @@ function phoneEvent(event) {
   if (["turn_start", "turn_end", "agent_start", "agent_end", "agent_settled"].includes(type)) return { type, sessionPath }
   if (type === "extension_ui_request") return event
   if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(type)) {
-    const { toolCallId, toolName, isError, partialResult, result } = event
-    return { type, sessionPath, toolCallId, toolName, isError,
+    const { toolCallId, toolName, isError, durationMs, partialResult, result } = event
+    return { type, sessionPath, toolCallId, toolName, isError, durationMs,
       partialResult: partialResult && { content: phoneContent(partialResult.content) },
       result: result && { content: phoneContent(result.content) } }
   }

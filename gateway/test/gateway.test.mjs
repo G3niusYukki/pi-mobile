@@ -266,6 +266,9 @@ test("decrypted phone events exclude Pi thinking across partials, finals and run
   await gateway.rpc({ id: "privacy", type: "prompt", message: "synthetic privacy fixture" })
   const events = await delivery
   assert.doesNotMatch(JSON.stringify(events), /fixture-private/)
+  assert.deepEqual(events.filter(e => e.type === "run_phase"), [
+    { type: "run_phase", phase: "thinking" }, { type: "run_phase", phase: "preparing_tool" },
+  ], "phase changes must arrive without snapshots, arguments or tokens")
   assert.equal(events.find(e => e.assistantMessageEvent?.type === "text_delta").assistantMessageEvent.delta, "思考：<think>literal</think>")
   assert.deepEqual(events.find(e => e.type === "tool_execution_end").result.content, [{ type: "text", text: "tool output" }])
   assert.deepEqual(events.find(e => e.type === "message_end" && e.message.role === "assistant").message.content, [{ type: "text", text: "思考：<think>literal</think>" }])
@@ -479,4 +482,24 @@ test("gateway：原生会话操作被扩展取消时保留 cancelled ACK", { tim
     const response = await gateway.rpc({ id: type, type, sessionPath: gateway.sessionPath })
     assert.deepEqual(response, { id: type, success: true, data: { cancelled: true } })
   }
+})
+
+test("user photos use small metadata-only live echoes and get_messages; inline history stays sealed", async t => {
+  const gateway = await connectGateway(t)
+  const image = { type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGM4UCDxHwAFhAJIWblWNgAAAABJRU5ErkJggg==" }
+  const caption = "synthetic photo fixture"
+  const delivery = gateway.collectEventsUntil("agent_settled")
+  await gateway.rpc({ type: "prompt", id: "photo", message: caption, images: [{ ...image, sourcePath: "/private/example" }] })
+  const expected = { role: "user", content: [{ type: "text", text: caption }, { type: "image", mimeType: "image/png" }] }
+  const events = (await delivery).filter(event => event.message?.role === "user")
+  assert.deepEqual(events.map(event => event.message), [expected, expected])
+  const transcript = await gateway.rpc({ id: "transcript", type: "get_messages" })
+  assert.deepEqual(transcript.data.messages, [expected])
+
+  const sessionPath = join(gateway.sessionDir, "photo.jsonl")
+  writeFileSync(sessionPath, [
+    { type: "session", id: "s" }, { type: "message", id: "photo", message: { role: "user", content: [image] } },
+  ].map(row => JSON.stringify(row)).join("\n"))
+  const response = await gateway.rpc({ id: "history-photo", type: "session_history", sessionPath })
+  assert.deepEqual(response.data.messages, [{ id: "photo", role: "user", text: "", attachments: [image] }])
 })

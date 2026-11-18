@@ -2,7 +2,7 @@ import { closeSync, constants, createReadStream, fstatSync, lstatSync, openSync,
 import { join, resolve } from "node:path"
 import { createInterface } from "node:readline"
 import { Worker, parentPort, workerData } from "node:worker_threads"
-import { createSessionTree } from "./history.mjs"
+import { createSessionTree, projectUserContent } from "./history.mjs"
 
 const LIMIT = 50
 const TITLE_LENGTH = 48
@@ -51,10 +51,14 @@ function preview(record) {
   const message = record.message
   if (record.type !== "message" || !["user", "assistant"].includes(message?.role)) return {}
   const content = message.content
+  if (message.role === "user") {
+    const { text, attachments } = projectUserContent(content, undefined, "\n")
+    return { role: message.role, lines: sentences(text), image: attachments.length > 0 }
+  }
   if (typeof content === "string") return { role: message.role, lines: sentences(content) }
   if (!Array.isArray(content)) return {}
   const text = content.filter(block => block?.type === "text" && typeof block.text === "string").map(block => block.text).join("\n")
-  return { role: message.role, lines: sentences(text), image: content.some(block => block?.type === "image") }
+  return { role: message.role, lines: sentences(text) }
 }
 
 function describe({ header, entries }) {

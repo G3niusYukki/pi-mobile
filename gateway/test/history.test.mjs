@@ -233,6 +233,73 @@ test("会话历史：严格接口返回路径，空会话成功，文件与路�
     assert.throws(() => history.readSessionHistoryStrict(file, dir))
 })
 
+const piResizeHint = "[Image: original 2853x2007, displayed at 2000x1407. Multiply coordinates by 1.43 to map to original image.]"
+const pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGM4UCDxHwAFhAJIWblWNgAAAABJRU5ErkJggg=="
+const photo = { type: "image", mimeType: "image/png", data: pixel }
+
+function photoHistory(t, messages) {
+    const { dir, file } = fixture(t, [
+        { type: "session", id: "photos" },
+        ...messages.map((message, index) => ({ type: "message", id: String(index), message })),
+    ])
+    return history.readSessionHistoryStrict(file, dir).messages
+}
+
+test("图片历史保留原图或诚实占位，仅移除 Pi 添加的提示，保留用户的原始格式", t => {
+    const caption = "  查看这张图。  \n"
+    const literal = `请解释 ${piResizeHint}`
+    const rows = photoHistory(t, [
+        { role: "user", content: [{ type: "text", text: `${caption}\n\n[Image converted from image/heic to image/png.]\n${piResizeHint}` },
+            { ...photo, path: "/private/example", extra: "private" }] },
+        { role: "user", content: [photo] },
+        { role: "user", content: `\n\n${piResizeHint}` },
+        { role: "user", content: literal },
+        { role: "assistant", content: [{ type: "thinking", thinking: "private" }, { type: "text", text: piResizeHint }, photo] },
+        { role: "user", content: `我看到这一行：\n${piResizeHint}` },
+    ])
+    assert.deepEqual(rows, [
+        { id: "0", role: "user", text: caption, attachments: [photo] },
+        { id: "1", role: "user", text: "", attachments: [photo] },
+        { id: "2", role: "user", text: "", attachments: [{ type: "image" }] },
+        { id: "3", role: "user", text: literal },
+        { id: "4", role: "assistant", text: piResizeHint },
+        { id: "5", role: "user", text: `我看到这一行：\n${piResizeHint}` },
+    ])
+})
+
+test("历史中的外部地址、伪造或过大图片仅返回占位，数量和单次总字节均受限", t => {
+    const png = Buffer.from(pixel, "base64")
+    const nearLimit = Buffer.concat([png, Buffer.alloc(1_100_000)]).toString("base64")
+    const inputs = [
+        { type: "image", url: "file:///private/example", path: "/private/example" },
+        { ...photo, data: "%%%" }, { ...photo, mimeType: "image/svg+xml" },
+        { ...photo, mimeType: "image/jpeg" }, { ...photo, data: Buffer.alloc(2 * 1024 * 1024 + 1).toString("base64") },
+    ]
+    const rows = photoHistory(t, [
+        { role: "user", content: inputs },
+        { role: "user", content: Array(20).fill({ type: "image" }) },
+        { role: "user", content: [{ ...photo, data: nearLimit }] },
+        { role: "user", content: [{ ...photo, data: nearLimit }] },
+    ])
+    assert.equal(rows.length, 4)
+    assert.equal(rows[0].attachments.length, inputs.length)
+    assert.ok(rows[0].attachments.every(item => item.type === "image" && !item.data && !item.path && !item.url))
+    assert.equal(rows[1].attachments.length, 8)
+    assert.equal(rows[2].attachments[0].data, undefined)
+    assert.ok(rows[3].attachments[0].data === nearLimit, "先为最近消息分配本次预览预算")
+})
+
+test("工具可用调用 ID 落盘空结果并复原失败状态", t => {
+    assert.deepEqual(photoHistory(t, [
+        { role: "toolResult", toolCallId: "empty", toolName: "edit", content: [] },
+        { role: "toolResult", toolCallId: "failed", toolName: "read", isError: true, content: "No file" },
+        { role: "toolResult", toolCallId: "", toolName: "read", content: [] },
+    ]), [
+        { id: "0", role: "tool", toolTitle: "edit", toolCallId: "empty", text: "" },
+        { id: "1", role: "tool", toolTitle: "read", toolCallId: "failed", isError: true, text: "No file" },
+    ])
+})
+
 test("会话历史：不能通过目录内符号链接读取目录外文件", (t) => {
     const { dir } = fixture(t)
     const outside = fixture(t, [

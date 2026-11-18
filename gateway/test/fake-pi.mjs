@@ -6,6 +6,7 @@ process.stdin.setEncoding("utf8")
 let buffer = ""
 let isStreaming = false
 let pendingMessageCount = 0
+let lastUserPhoto
 let model
 let thinkingLevel
 let sessionFile
@@ -41,12 +42,21 @@ async function handle(cmd) {
         isStreaming = true
         reply({ disposition: "started" })
         output({ type: "agent_start" })
-        if (cmd.message === "synthetic privacy fixture") {
+        if (cmd.message === "synthetic photo fixture") {
+          const hint = "[Image: original 2853x2007, displayed at 2000x1407. Multiply coordinates by 1.43 to map to original image.]"
+          lastUserPhoto = { role: "user", content: [{ type: "text", text: `${cmd.message}\n\n${hint}` }, ...cmd.images] }
+          output({ type: "message_start", message: lastUserPhoto })
+          output({ type: "message_end", message: lastUserPhoto })
+          settle()
+        } else if (cmd.message === "synthetic privacy fixture") {
           const hidden = { type: "thinking", thinking: "fixture-private-thought", thinkingSignature: "fixture-private-signature" }
           const message = { role: "assistant", content: [hidden, { type: "text", text: "思考：<think>literal</think>" }] }
           output({ type: "message_start", message })
           for (const update of [
-            { type: "thinking_delta", delta: hidden.thinking }, { type: "thinking_end", content: hidden.thinking },
+            { type: "thinking_start", contentIndex: 0 }, { type: "thinking_delta", delta: hidden.thinking },
+            { type: "thinking_end", content: hidden.thinking },
+            { type: "toolcall_start", contentIndex: 1, id: "call1", toolName: "read" },
+            { type: "toolcall_delta", delta: "fixture-private-args" },
             { type: "text_delta", contentIndex: 1, delta: message.content[1].text },
           ]) output({ type: "message_update", message, assistantMessageEvent: { ...update, partial: message } })
           const result = { content: [{ type: "text", text: "tool output" }], details: { messages: [message] } }
@@ -62,7 +72,7 @@ async function handle(cmd) {
       }
       break
     case "get_messages":
-      reply({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "fixture-private" }, { type: "text", text: "answer" }] }] })
+      reply({ messages: [lastUserPhoto ?? { role: "assistant", content: [{ type: "thinking", thinking: "fixture-private" }, { type: "text", text: "answer" }] }] })
       break
     case "get_state":
       if (Object.hasOwn(cmd, "afterSettingChangeId")) fail("Gateway-only field reached Pi")

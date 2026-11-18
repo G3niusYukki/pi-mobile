@@ -1,13 +1,64 @@
 import { readFileSync, realpathSync } from "node:fs"
 import { isAbsolute, relative, resolve, sep } from "node:path"
 
-function textFromContent(content) {
+// Pi appends complete normalization hints to the prompt, separated by two line breaks.
+// Match only that suffix so quotations, code and ordinary bracketed captions remain intact.
+const imageHint = String.raw`\[(?:Image: original [0-9]+x[0-9]+, displayed at [0-9]+x[0-9]+\. Multiply coordinates by [0-9]+\.[0-9]+ to map to original image\.|Image converted from image/[A-Za-z0-9.+-]+ to image/[A-Za-z0-9.+-]+\.|Image omitted: could not be (?:converted to a supported inline image format|resized below the inline image size limit)\.)\]`
+const hintSuffix = new RegExp(String.raw`(?:^|(?:\r?\n){2})${imageHint}(?:\r?\n${imageHint})*[ \t]*(?:\r?\n)?$`)
+const photoTypes = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
+export const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024
+const MAX_PHOTOS_PER_MESSAGE = 8
+const RELAY_FRAME_BYTES = 12 * 1024 * 1024
+
+function matchesPhotoType(bytes, mime) {
+    switch (mime) {
+        case "image/png": return bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))
+        case "image/jpeg": return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+        case "image/gif": return ["GIF87a", "GIF89a"].includes(bytes.toString("latin1", 0, 6))
+        case "image/webp": return bytes.toString("latin1", 0, 4) === "RIFF" && bytes.toString("latin1", 8, 12) === "WEBP"
+        default: return false
+    }
+}
+
+function projectPhoto(block, budget) {
+    const photo = { type: "image" }
+    if (!photoTypes.has(block.mimeType)) return photo
+    photo.mimeType = block.mimeType
+    // Catalog and live echoes receive metadata only. Never resolve paths, URLs, or other producer fields.
+    if (!budget || typeof block.data !== "string") return photo
+    const encoded = block.data
+    if (!encoded.length || encoded.length % 4 !== 0 || encoded.length + 16 > budget.wire ||
+        encoded.length > 4 * Math.ceil(budget.raw / 3)) return photo
+    const bytes = Buffer.from(encoded, "base64")
+    if (bytes.length > budget.raw || !matchesPhotoType(bytes, photo.mimeType) || bytes.toString("base64") !== encoded) return photo
+    photo.data = encoded
+    budget.raw -= bytes.length
+    budget.wire -= encoded.length + 16  // Includes the JSON data field.
+    return photo
+}
+
+export function projectUserContent(content, budget, separator = "") {
+    const rawText = textFromContent(content, separator)
+    const text = rawText.includes("[Image") ? rawText.replace(hintSuffix, "") : rawText
+    const attachments = []
+    if (Array.isArray(content)) {
+        for (const block of content) {
+            if (block?.type !== "image") continue
+            attachments.push(projectPhoto(block, budget))
+            if (attachments.length === MAX_PHOTOS_PER_MESSAGE) break
+        }
+    }
+    if (!attachments.length && text !== rawText) attachments.push({ type: "image" })
+    return { text, attachments }
+}
+
+function textFromContent(content, separator = "") {
     if (typeof content === "string") return content
     if (!Array.isArray(content)) return ""
     return content
         .filter((block) => block && block.type === "text" && typeof block.text === "string")
         .map((block) => block.text)
-        .join("")
+        .join(separator)
 }
 
 function isWithin(root, target) {
@@ -68,17 +119,30 @@ export function readSessionHistoryStrict(sessionPath, sessionDir, options = {}) 
     const tree = createSessionTree()
     for (const line of readFileSync(realTarget, "utf8").split(/\r?\n/)) tree.addLine(line)
     const messages = []
+    const photoSources = new Map()
     for (const record of tree.activeBranch().entries) {
         if (record.type !== "message" || !record.message) continue
         const message = record.message
         const role = message.role
-        const body = textFromContent(message.content)
-        if (!body.trim()) continue
-        if (role === "user" || role === "assistant") {
-            messages.push({ id: record.id, role, text: body })
+        if (role === "user") {
+            const { text, attachments } = projectUserContent(message.content)
+            if (!attachments.length && !text.trim()) continue
+            const row = { id: record.id, role, text }
+            if (attachments.length) {
+                row.attachments = attachments
+                if (Array.isArray(message.content)) photoSources.set(record.id, message.content)
+            }
+            messages.push(row)
+        } else if (role === "assistant") {
+            const text = textFromContent(message.content)
+            if (text.trim()) messages.push({ id: record.id, role, text })
         } else if (role === "toolResult") {
-            const tool = { id: record.id, role: "tool", toolTitle: String(message.toolName ?? "工具"), text: body }
-            if (typeof message.toolCallId === "string") tool.toolCallId = message.toolCallId
+            const text = textFromContent(message.content)
+            const callId = typeof message.toolCallId === "string" && message.toolCallId.trim() ? message.toolCallId : undefined
+            if (!text.trim() && !callId) continue
+            const tool = { id: record.id, role: "tool", toolTitle: String(message.toolName ?? "工具"), text }
+            if (callId) tool.toolCallId = callId
+            if (message.isError === true) tool.isError = true
             messages.push(tool)
         }
     }
@@ -87,7 +151,17 @@ export function readSessionHistoryStrict(sessionPath, sessionDir, options = {}) 
     let start = Math.max(0, messages.length - 80)
     const anchorIndex = typeof options?.anchorId === "string" ? messages.findIndex((message) => message.id === options.anchorId) : -1
     if (anchorIndex >= 0) start = Math.min(start, anchorIndex)
-    return { sessionPath: target, messages: messages.slice(start), hasEarlierMessages: start > 0 }
+    const result = { sessionPath: target, messages: messages.slice(start), hasEarlierMessages: start > 0 }
+    if (photoSources.size) {
+        // Prioritize recent photos. Leave room for the existing text, sealed base64, nonce, tag and RPC envelope.
+        const budget = { raw: MAX_ATTACHMENT_BYTES, wire: Math.floor(RELAY_FRAME_BYTES * 3 / 4) - 4096 - Buffer.byteLength(JSON.stringify(result)) }
+        for (let i = result.messages.length - 1; i >= 0 && budget.raw > 0 && budget.wire > 16; i--) {
+            const row = result.messages[i]
+            const source = photoSources.get(row.id)
+            if (source) row.attachments = projectUserContent(source, budget).attachments
+        }
+    }
+    return result
 }
 
 /// 保持已有数组调用方兼容；RPC 必须使用上面的严格接口传回错误。
