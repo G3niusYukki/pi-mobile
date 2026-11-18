@@ -171,6 +171,11 @@ struct ConversationScreen: View {
                 actionTitle: "重新配对",
                 action: { showsPairingReset = true }
             )
+        } else if let notice = model.pendingDeliveryNotice {
+            actionBanner(icon: "clock", text: notice, actionTitle: "关闭", tint: Theme.textSecondary, action: model.clearError)
+        } else if let notice = model.pendingDeliveryNotice {
+            actionBanner(icon: "clock", text: notice, actionTitle: "关闭", tint: Theme.textSecondary,
+                         action: { model.clearError() })
         } else if let error = model.errorMessage {
             actionBanner(
                 icon: "exclamationmark.triangle.fill",
@@ -200,7 +205,8 @@ struct ConversationScreen: View {
         }
     }
 
-    private func actionBanner(icon: String, text: String, actionTitle: String, action: @escaping () -> Void) -> some View {
+    private func actionBanner(icon: String, text: String, actionTitle: String, tint: Color = Theme.coral,
+                              action: @escaping () -> Void) -> some View {
         HStack(spacing: 8) {
             Image(systemName: icon)
             Text(text)
@@ -210,7 +216,7 @@ struct ConversationScreen: View {
                 .appFont(.caption.weight(.semibold))
         }
         .appFont(.caption)
-        .foregroundStyle(Theme.coral)
+        .foregroundStyle(tint)
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .background(Color(uiColor: .secondarySystemBackground))

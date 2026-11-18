@@ -25,6 +25,7 @@ struct PiMobileApp: App {
             .onAppear { model.bootstrap() }
             .onChange(of: phase) { _, newValue in
                 if newValue == .active { model.resume() }
+                if newValue == .background { model.suspendConnectionChecks() }
             }
         }
     }

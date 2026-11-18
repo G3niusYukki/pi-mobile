@@ -51,6 +51,25 @@ let shuttingDown = false
 let serial = 0
 const nativeRequests = new Map()
 const pendingStateChanges = new Set()
+const promptReceipts = new Map() // original phone ID → native preflight result
+const RECEIPT_LIMIT = 128
+const MAX_RECEIPT_ID_LENGTH = 128
+let phonePublicKey
+let pairingGeneration = 0
+
+// Pi echoes this opaque ID. It carries the sender's generation so even a long
+// preflight can return its direct ACK without keeping an unbounded pending map.
+function promptIdPrefix() { return `gateway-prompt-${pairingGeneration}:` }
+
+function rememberPromptReceipt(id, record) {
+  if (typeof id !== "string" || id.length > MAX_RECEIPT_ID_LENGTH) return
+  const receipt = { id, success: record.success }
+  if (["started", "queued", "handled"].includes(record.data?.disposition)) receipt.data = { disposition: record.data.disposition }
+  if (!record.success && typeof record.error === "string") receipt.error = record.error.slice(0, 2048)
+  promptReceipts.delete(id)
+  promptReceipts.set(id, receipt)
+  if (promptReceipts.size > RECEIPT_LIMIT) promptReceipts.delete(promptReceipts.keys().next().value)
+}
 
 function toRelay(obj) {
   if (relay?.readyState === WebSocket.OPEN) relay.send(JSON.stringify(obj))
@@ -95,7 +114,20 @@ function phoneEvent(event) {
   // Session-internal events (including entry_appended) can carry entire raw records.
   return null
 }
+function sendReply(response) {
+  toRelay({ type: "rpc_response", sealed: seal(response) })
+}
+
 function respond(record) {
+  if (record.command === "prompt") {
+    const prefix = promptIdPrefix()
+    if (typeof record.success !== "boolean" || typeof record.id !== "string" || !record.id.startsWith(prefix)) return
+    let id
+    try { id = JSON.parse(record.id.slice(prefix.length)) } catch { return }
+    rememberPromptReceipt(id, record)
+    sendReply({ id, success: record.success, data: record.data, error: record.error })
+    return
+  }
   const tracked = nativeRequests.get(record.id)
   const request = tracked?.type === record.command ? tracked : undefined
   let data = record.data
@@ -108,21 +140,40 @@ function respond(record) {
       pendingStateChanges.delete(request.done)
       request.resolve()
     }
+    if (request.pairingGeneration !== pairingGeneration) return
     if (request.type === "get_state" && record.success === true && data && typeof data === "object") {
       data = { ...data, sessionBarrier: true }
+      if (request.promptReceiptIds) {
+        data.promptReceipts = request.promptReceiptIds.filter(id => promptReceipts.has(id)).map(id => promptReceipts.get(id))
+      }
       if (typeof request.afterSessionChangeId === "string") data.sessionBarrierId = request.afterSessionChangeId
       if (typeof request.afterSettingChangeId === "string") data.settingBarrierId = request.afterSettingChangeId
     }
   }
-  const sealed = seal({ id: request ? request.id : record.id ?? null, success: record.success, data, error: record.error })
-  toRelay({ type: "rpc_response", sealed })
+  sendReply({ id: request ? request.id : record.id ?? null, success: record.success, data, error: record.error })
 }
 function failNativeRequests(error) {
   for (const [id, request] of nativeRequests) {
     respond({ type: "response", id, command: request.type, success: false, error })
   }
 }
+function canWriteToPi() {
+  return child?.stdin?.writable && child.exitCode === null && child.signalCode === null
+}
+
 function forwardToPi(obj) {
+  if (obj?.type === "prompt") {
+    const id = obj.id ?? null
+    if (!canWriteToPi()) {
+      sendReply({ id, success: false, error: "Pi process is not available" })
+      return
+    }
+    const nativeId = promptIdPrefix() + JSON.stringify(id)
+    // A pipe error or process exit after write() cannot prove Pi rejected the prompt.
+    promptReceipts.delete(id)
+    child.stdin.write(`${JSON.stringify({ ...obj, id: nativeId })}\n`)
+    return
+  }
   const isStateChange = ["switch_session", "new_session", "set_model", "set_thinking_level"].includes(obj?.type)
   if (!isStateChange && obj?.type !== "get_state") {
     if (child?.stdin?.writable) child.stdin.write(`${JSON.stringify(obj)}\n`)
@@ -130,15 +181,18 @@ function forwardToPi(obj) {
   }
   // 独立的原生 ID 避免客户端 ID 缺失/复用误解锁屏障；响应还原客户端 ID。
   const id = `gateway-native-${++serial}`
-  const { afterSessionChangeId, afterSettingChangeId, ...command } = obj
-  const request = { id: obj.id ?? null, type: obj.type, afterSessionChangeId, afterSettingChangeId }
+  const { afterSessionChangeId, afterSettingChangeId, promptReceiptIds, ...command } = obj
+  const request = { id: obj.id ?? null, type: obj.type, afterSessionChangeId, afterSettingChangeId, pairingGeneration }
+  if (obj.type === "get_state" && Array.isArray(promptReceiptIds)) {
+    request.promptReceiptIds = [...new Set(promptReceiptIds.slice(0, 32).filter(id => typeof id === "string" && id.length <= MAX_RECEIPT_ID_LENGTH))]
+  }
   if (isStateChange) {
     request.done = new Promise((resolve) => { request.resolve = resolve })
     pendingStateChanges.add(request.done)
   }
   // 必须在写 stdin 前同步登记，后续 get_state 才能看到所有已接收的会话和设置变更。
   nativeRequests.set(id, request)
-  if (!child?.stdin?.writable || child.exitCode !== null || child.signalCode !== null) {
+  if (!canWriteToPi()) {
     respond({ type: "response", id, command: obj.type, success: false, error: "Pi process is not available" })
     return
   }
@@ -150,8 +204,9 @@ function forwardToPi(obj) {
 }
 async function stateAfterChanges(command) {
   // Pi 会并发处理 JSONL 命令；仅状态查询等待，扩展 UI 回复仍可解除原生 hook。
+  const sender = pairingGeneration
   while (pendingStateChanges.size) await Promise.all([...pendingStateChanges])
-  forwardToPi(command)
+  if (sender === pairingGeneration) forwardToPi(command)
 }
 function toPi(obj) {
   if (obj?.type === "get_state") void stateAfterChanges(obj)
@@ -239,6 +294,12 @@ function connect() {
         toRelay({ type: "error", message: "端到端密钥协商失败，请重新配对" })
         return
       }
+      const pub = Buffer.from(msg.pub, "base64url").toString("base64url")
+      if (pub !== phonePublicKey) {
+        phonePublicKey = pub
+        pairingGeneration++
+        promptReceipts.clear()
+      }
       console.log("[gateway] 端到端加密已启用")
       return
     }
@@ -276,7 +337,7 @@ function connect() {
       if (msg.type === "rpc") {
         const images = msg.command?.images
         if (Array.isArray(images) && images.some((image) => Buffer.byteLength(String(image.data ?? ""), "base64") > MAX_ATTACHMENT_BYTES)) {
-          toRelay({ type: "error", message: `单张图片超过 ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MiB，请在手机上压缩后重试` })
+          sendReply({ id: msg.command.id ?? null, success: false, error: `单张图片超过 ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MiB，请在手机上压缩后重试` })
           return
         }
       }

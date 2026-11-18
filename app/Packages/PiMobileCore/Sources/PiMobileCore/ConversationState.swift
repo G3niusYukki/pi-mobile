@@ -17,12 +17,14 @@ public struct ConversationState {
     }
 
     private struct Prompt {
-        let text: String
-        let userID: UUID
+        let user: ChatMessage
         let assistantID: UUID?
         let conversationID: UUID
+        var unconfirmed = false
+        var matchingHistory: ChatMessage?
     }
 
+    public static let promptReceiptLimit = 32
     public private(set) var messages: [ChatMessage] = []
     public private(set) var streamingID: UUID?
     public private(set) var isRunning = false
@@ -48,9 +50,15 @@ public struct ConversationState {
     public var canSend: Bool { pendingChange == nil && isSessionReady }
     public var pendingHistoryID: String? { historyRequest?.id }
     public var pendingStateID: String? { stateRequestID }
+    public var hasPromptCapacity: Bool { prompts.count < Self.promptReceiptLimit }
+    public var unconfirmedPromptIDs: [String] {
+        prompts.compactMap { $0.value.unconfirmed ? $0.key : nil }.sorted()
+    }
+
+    public func hasPendingPrompt(id: String) -> Bool { prompts[id]?.conversationID == conversationID }
 
     public mutating func preparePrompt(id: String, text: String, image: Data? = nil, connected: Bool) -> [String: Any]? {
-        guard connected, canSend, !text.isEmpty || image != nil else { return nil }
+        guard connected, canSend, hasPromptCapacity, prompts[id] == nil, !text.isEmpty || image != nil else { return nil }
         let user = ChatMessage(role: .user, text: text, attachments: image.map { [ChatAttachments.localPhoto($0)] } ?? [])
         messages.append(user)
         var assistantID: UUID?
@@ -63,7 +71,7 @@ public struct ConversationState {
             streamingID = pending.id
             assistantID = pending.id
         }
-        prompts[id] = Prompt(text: text, userID: user.id, assistantID: assistantID, conversationID: conversationID)
+        prompts[id] = Prompt(user: user, assistantID: assistantID, conversationID: conversationID)
         isRunning = true
         revision += 1
         stateRequestID = nil
@@ -78,7 +86,11 @@ public struct ConversationState {
     @discardableResult
     public mutating func resolvePrompt(id: String, success: Bool, disposition: String? = nil) -> String? {
         guard let prompt = prompts.removeValue(forKey: id), prompt.conversationID == conversationID else { return nil }
-        if !success { messages.removeAll { $0.id == prompt.userID } }
+        if !success, let index = messages.firstIndex(where: { $0.id == prompt.user.id }) {
+            // A display match by text could have been another device's message. Keep its exact saved content.
+            if let saved = prompt.matchingHistory, messages[index].sourceID == saved.sourceID { messages[index] = saved }
+            else { messages.remove(at: index) }
+        }
         if !success || disposition == "handled" {
             if let assistantID = prompt.assistantID,
                let index = messages.firstIndex(where: { $0.id == assistantID }), messages[index].text.isEmpty {
@@ -89,13 +101,13 @@ public struct ConversationState {
                 }
             }
         }
-        return success ? nil : prompt.text
+        return success ? nil : prompt.user.text
     }
 
-    public mutating func abandonPrompt(id: String) {
-        // A socket error may occur after delivery. Keep the user's visible message;
-        // get_state/history will reconcile it, and no automatic resend takes place.
-        guard let prompt = prompts.removeValue(forKey: id), prompt.conversationID == conversationID else { return }
+    public mutating func markPromptUnconfirmed(id: String) {
+        // A deadline or socket error can follow delivery. Keep the original ID and user row for an exact receipt.
+        guard let prompt = prompts[id], !prompt.unconfirmed else { return }
+        prompts[id]?.unconfirmed = true
         if let assistantID = prompt.assistantID,
            let index = messages.firstIndex(where: { $0.id == assistantID }), messages[index].text.isEmpty {
             messages.remove(at: index)
@@ -167,14 +179,14 @@ public struct ConversationState {
         guard let request = historyRequest, request.id == id,
               path == nil || path == request.path else { return false }
         historyRequest = nil
-        let changed = sessionPath != request.path
+        // The first path can be assigned after sending a new conversation's first prompt.
+        let changed = sessionPath != request.path && (sessionPath != nil || !isSessionReady)
         let previous = changed ? [] : messages
         let preserveTail = !changed && (isRunning || awaitingRunState || revision != request.revision || !prompts.isEmpty)
-        messages = Self.mergeHistory(items, path: request.path, previous: previous, interruptedIDs: interruptedIDs, preserveTail: preserveTail, hasEarlierMessages: hasEarlierMessages)
+        messages = Self.mergeHistory(items, path: request.path, previous: previous, interruptedIDs: interruptedIDs, preserveTail: preserveTail, hasEarlierMessages: hasEarlierMessages, prompts: &prompts)
         interruptedIDs.formIntersection(messages.filter { $0.sourceID == nil }.map(\.id))
         if changed {
-            // Binding the first discovered path does not reset a new conversation.
-            if sessionPath != nil || !isSessionReady { conversationID = UUID() }
+            conversationID = UUID()
             awaitingRunState = false
             streamingID = nil
             isRunning = false
@@ -271,7 +283,7 @@ public struct ConversationState {
         isWaitingForSessionResponse = false
         historyRequest = nil
         stateRequestID = nil
-        prompts.removeAll()
+        for id in prompts.keys { markPromptUnconfirmed(id: id) }
     }
 
     /// Events lack request IDs. Ignore events while a native session transition is
@@ -399,7 +411,8 @@ public struct ConversationState {
         streamingID = nil
     }
 
-    private static func mergeHistory(_ items: [[String: Any]], path: String, previous: [ChatMessage], interruptedIDs: Set<UUID>, preserveTail: Bool, hasEarlierMessages: Bool) -> [ChatMessage] {
+    private static func mergeHistory(_ items: [[String: Any]], path: String, previous: [ChatMessage], interruptedIDs: Set<UUID>, preserveTail: Bool, hasEarlierMessages: Bool, prompts: inout [String: Prompt]) -> [ChatMessage] {
+        let pendingUsers = Dictionary(uniqueKeysWithValues: prompts.map { ($0.value.user.id, $0.key) })
         var consumed = Set<UUID>()
         var merged: [ChatMessage] = []
         for (offset, item) in items.enumerated() {
@@ -424,7 +437,11 @@ public struct ConversationState {
                     let partial = old.streaming || interruptedIDs.contains(old.id)
                     return old.text == text || (partial && !old.text.isEmpty && (text.hasPrefix(old.text) || old.text.hasPrefix(text)))
                 }
+            func savedMessage() -> ChatMessage {
+                ChatMessage(id: historyID(path: path, entry: sourceID), role: role, text: text, toolTitle: tool, sourceID: sourceID, toolCallID: callID, toolStatus: toolFailed ? .failed : .finished, attachments: photos)
+            }
             if var message = match {
+                if let id = pendingUsers[message.id] { prompts[id]?.matchingHistory = savedMessage() }
                 consumed.insert(message.id)
                 let partial = message.streaming || interruptedIDs.contains(message.id)
                 if !partial || !preserveTail || text.count >= message.text.count { message.text = text }
@@ -440,7 +457,7 @@ public struct ConversationState {
                 if !preserveTail { message.streaming = false }
                 merged.append(message)
             } else {
-                merged.append(ChatMessage(id: historyID(path: path, entry: sourceID), role: role, text: text, toolTitle: tool, sourceID: sourceID, toolCallID: callID, toolStatus: toolFailed ? .failed : .finished, attachments: photos))
+                merged.append(savedMessage())
             }
         }
         if hasEarlierMessages, let firstID = items.first?["id"] as? String,
@@ -474,7 +491,15 @@ public struct ConversationState {
             consumed.insert(message.id)
         }
         if preserveTail {
-            merged.append(contentsOf: previous.filter { !consumed.contains($0.id) && ($0.sourceID == nil || $0.streaming) })
+            for row in previous where !consumed.contains(row.id) {
+                if let id = pendingUsers[row.id], let prompt = prompts[id] {
+                    // The saved branch no longer contains the display match. Its unconfirmed phone row still belongs here.
+                    prompts[id]?.matchingHistory = nil
+                    merged.append(prompt.user)
+                } else if row.sourceID == nil || row.streaming {
+                    merged.append(row)
+                }
+            }
         }
         return merged
     }

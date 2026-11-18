@@ -181,7 +181,7 @@ async function connectGateway(t, fakeEnv = {}) {
   const gatewayPub = pairOutput.match(/pair#[a-f0-9]{32}\.([A-Za-z0-9_-]{43})/)?.[1]
   assert.ok(gatewayPub, "配对链接应带网关公钥")
   assert.ok(token, `没有拿到配对 token：${pairOutput.slice(-300)}`)
-  const phoneCrypto = clientCrypto(gatewayPub)
+  let phoneCrypto = clientCrypto(gatewayPub)
   phone = new WebSocket(`ws://127.0.0.1:${port}/pi/client`)
   await once(phone, "open")
   const paired = waitMessage(phone, (message) => message.type === "paired")
@@ -214,15 +214,37 @@ async function connectGateway(t, fakeEnv = {}) {
     waitForPairingKeyRequest() {
       return waitMessage(phone, (message) => message.type === "status" && message.needsPairingKey === true)
     },
-    async reconnect() {
+    waitForOffline() {
+      return waitMessage(phone, message => message.type === "status" && message.state === "unknown")
+    },
+    async disconnect() {
       const closed = once(phone, "close")
       phone.close()
       await closed
+    },
+    async releasePreflight() {
+      const released = waitFor(gateway.stderr, text => text.includes("fixture preflight completed"))
+      writeFileSync(join(dir, "release-preflight"), "")
+      await released
+    },
+    observeResponses() {
+      const responses = []
+      phone.on("message", raw => {
+        const msg = JSON.parse(String(raw))
+        if (msg.type === "rpc_response") responses.push(phoneCrypto.open(msg.sealed))
+      })
+      return responses
+    },
+    async reconnect({ newKey = false } = {}) {
+      if (phone.readyState === WebSocket.OPEN) await this.disconnect()
+      if (newKey) phoneCrypto = clientCrypto(gatewayPub)
       phone = new WebSocket(`ws://127.0.0.1:${port}/pi/client`, { headers: { Authorization: `Bearer ${deviceToken}` } })
       const resumed = waitMessage(phone, (message) => message.type === "paired")
       await once(phone, "open")
       assert.equal((await resumed).deviceToken, deviceToken)
+      const ready = waitFor(gateway.stdout, text => text.includes("端到端加密已启用"))
       phone.send(JSON.stringify({ type: "pair_pub", pub: phoneCrypto.pub }))
+      await ready
     },
     async rpc(command, envelopeId = command.id) {
       const response = waitMessage(phone, (message) => message.type === "rpc_response"
@@ -253,6 +275,122 @@ async function connectGateway(t, fakeEnv = {}) {
     },
   }
 }
+
+test("prompt receipts recover a native ACK missed offline and stay unknown throughout preflight", async t => {
+  const gateway = await connectGateway(t)
+  const id = "prompt-00000000-0000-4000-8000-000000000001"
+  const snapshot = stateId => gateway.rpc({ type: "get_state", id: stateId, promptReceiptIds: [id, "not-delivered", id] })
+  const gate = gateway.event("extension_ui_request")
+  gateway.sendRpc({ type: "prompt", id, message: "fixture gated preflight", streamingBehavior: "steer" })
+  await gate
+  const pending = await snapshot("during-preflight")
+  assert.equal(pending.success, true, pending.error)
+  assert.equal(pending.data.isStreaming, true)
+  assert.deepEqual(pending.data.promptReceipts, [])
+  await gateway.disconnect()
+  await gateway.releasePreflight()
+  await gateway.reconnect()
+  for (const stateId of ["recovered", "recovered-again"]) {
+    const state = await snapshot(stateId)
+    assert.deepEqual(state.data.promptReceipts, [{ id, success: true, data: { disposition: "started" } }])
+    assert.equal(state.data.pendingMessageCount, 0, "a state query must not enqueue the prompt again")
+  }
+})
+
+test("prompt receipts preserve native failure and legacy success, and limit reads to 32 requested IDs", async t => {
+  const gateway = await connectGateway(t)
+  const legacy = await gateway.rpc({ type: "prompt", id: "legacy", message: "fixture old Pi ACK" })
+  assert.deepEqual(legacy, { id: "legacy", success: true })
+  await gateway.rpc({ type: "prompt", id: "start", message: "first" })
+  const rejected = await gateway.rpc({ type: "prompt", id: "busy", message: "second" })
+  const queued = await gateway.rpc({ type: "prompt", id: "queue", message: "third", streamingBehavior: "steer" })
+  assert.equal(rejected.success, false)
+  assert.match(rejected.error, /Agent is already processing/)
+  assert.equal(queued.data.disposition, "queued")
+  const promptReceiptIds = ["legacy", "busy", "queue", ...Array.from({ length: 29 }, (_, i) => `unused-${i}`), "start"]
+  const state = await gateway.rpc({ type: "get_state", id: "with-receipts", promptReceiptIds })
+  assert.equal(state.success, true, state.error)
+  assert.deepEqual(state.data.promptReceipts, [legacy, rejected, queued])
+  assert.equal((await gateway.rpc({ type: "get_state", id: "legacy-state" })).data.promptReceipts, undefined)
+})
+
+test("prompt receipts and late direct ACKs stay with the submitting phone key", async t => {
+  const gateway = await connectGateway(t)
+  await gateway.rpc({ type: "prompt", id: "first-phone-known", message: "fixture old Pi ACK" })
+  const gate = gateway.event("extension_ui_request")
+  gateway.sendRpc({ type: "prompt", id: "first-phone-pending", message: "fixture gated preflight" })
+  await gate
+  await gateway.reconnect({ newKey: true })
+  const frames = gateway.observeResponses()
+  await gateway.releasePreflight()
+  const state = await gateway.rpc({ type: "get_state", id: "second-phone", promptReceiptIds: ["first-phone-known", "first-phone-pending"] })
+  assert.deepEqual(frames.map(frame => frame.id), ["second-phone"], "a previous phone's late reply cannot be encrypted for the new key")
+  assert.equal(state.success, true, state.error)
+  assert.deepEqual(state.data.promptReceipts, [])
+})
+
+test("prompt receipts cannot turn a failed native get_state into a successful snapshot", async t => {
+  const gateway = await connectGateway(t, { FAKE_PI_FAIL_GET_STATE: "1" })
+  await gateway.rpc({ type: "prompt", id: "known", message: "first" })
+  const state = await gateway.rpc({ type: "get_state", id: "failed-read", promptReceiptIds: ["known"] })
+  assert.deepEqual(state, { id: "failed-read", success: false, error: "fixture state hook failed" })
+})
+
+test("prompt receipts: oversized images return a sealed correlated rejection before forwarding", async t => {
+  const gateway = await connectGateway(t)
+  const id = "large-image"
+  const images = [{ type: "image", mimeType: "image/png", data: Buffer.alloc(2 * 1024 * 1024 + 1).toString("base64") }]
+  const rejection = await gateway.rpc({ type: "prompt", id, message: "fixture", images }, "untrusted-envelope-id")
+  assert.equal(rejection.id, id)
+  assert.equal(rejection.success, false)
+  assert.match(rejection.error, /2 MiB/)
+  const state = await gateway.rpc({ type: "get_state", id: "after-rejection", promptReceiptIds: [id] })
+  assert.equal(state.data.isStreaming, false)
+  assert.deepEqual(state.data.promptReceipts, [], "Pi never received this command")
+})
+
+test("prompt receipts: an unavailable child rejects the correlated prompt before any write", async t => {
+  const gateway = await connectGateway(t, { PI_BIN: join(tmpdir(), `pi-missing-fixture-${process.pid}`) })
+  const response = await gateway.rpc({ type: "prompt", id: "never-written", message: "fixture" })
+  assert.equal(response.id, "never-written")
+  assert.equal(response.success, false)
+  assert.match(response.error, /Pi process is not available/)
+})
+
+test("prompt receipts preserve an online native ACK across many other outstanding preflights", async t => {
+  const gateway = await connectGateway(t)
+  const gate = gateway.event("extension_ui_request")
+  const frames = gateway.observeResponses()
+  gateway.sendRpc({ type: "prompt", id: "late-online", message: "fixture gated preflight" })
+  await gate
+  for (let i = 0; i < 128; i++) {
+    gateway.sendRpc({ type: "prompt", id: `pending-${i}`, message: "fixture pending without ACK" })
+  }
+  await gateway.rpc({ type: "get_state", id: "requests-processed" })
+  await gateway.releasePreflight()
+  const state = await gateway.rpc({ type: "get_state", id: "after-preflight", promptReceiptIds: ["late-online", "pending-0"] })
+  assert.ok(frames.some(frame => frame.id === "late-online" && frame.success === true), "the waiting caller needs its direct native ACK")
+  assert.deepEqual(state.data.promptReceipts, [{ id: "late-online", success: true, data: { disposition: "started" } }])
+})
+
+test("prompt receipts stay unknown when the child exits after receiving the command", async t => {
+  const gateway = await connectGateway(t)
+  const frames = gateway.observeResponses()
+  const offline = gateway.waitForOffline()
+  gateway.sendRpc({ type: "prompt", id: "interrupted", message: "fixture child exits before ACK" })
+  await offline
+  assert.deepEqual(frames, [], "a process exit cannot decide what Pi did with the submitted prompt")
+})
+
+test("prompt receipts evict old confirmations as unknown", async t => {
+  const gateway = await connectGateway(t)
+  for (let i = 0; i <= 128; i++) {
+    await gateway.rpc({ type: "prompt", id: `receipt-${i}`, message: "fixture old Pi ACK" })
+  }
+  const state = await gateway.rpc({ type: "get_state", id: "window", promptReceiptIds: ["receipt-0", "receipt-128"] })
+  assert.equal(state.success, true, state.error)
+  assert.deepEqual(state.data.promptReceipts, [{ id: "receipt-128", success: true }])
+})
 
 test("native transcript RPC projects only visible assistant content", async t => {
   const gateway = await connectGateway(t)

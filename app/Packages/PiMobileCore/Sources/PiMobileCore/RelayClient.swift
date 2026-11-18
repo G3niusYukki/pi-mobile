@@ -35,6 +35,12 @@ public final class RelayClient: ObservableObject {
     private var handshake: Handshake?
     private var e2e: E2EKey?  // Only set after this socket's handshake completes.
     private var reconnectDelay: UInt64 = 1_000_000_000
+    private var retry: Task<Void, Never>?
+    private var isForeground = true
+    private let pongTimeout: Duration
+    private let heartbeatInterval: Duration
+    private var heartbeat: Task<Void, Never>?
+    private var probeID: UUID?
 
     public convenience init(endpoint: String? = nil) {
         self.init(endpoint: endpoint, store: .keychain, makeSocket: Self.webSocket)
@@ -47,10 +53,56 @@ public final class RelayClient: ObservableObject {
         return task
     }
 
-    init(endpoint: String?, store: PairingStore, makeSocket: @escaping (URLRequest) -> any RelaySocket) {
+    /// Probe the existing stream on return. A healthy socket keeps its in-flight work.
+    public func setForeground(_ foreground: Bool) {
+        guard isForeground != foreground else { return }
+        isForeground = foreground
+        cancelHeartbeat()
+        if foreground { probeSocket() }
+    }
+
+    init(endpoint: String?, store: PairingStore, pongTimeout: Duration = .seconds(8),
+         heartbeatInterval: Duration = .seconds(20), makeSocket: @escaping (URLRequest) -> any RelaySocket) {
         self.configuredEndpoint = endpoint.flatMap { URL(string: $0, encodingInvalidCharacters: false) }
         self.store = store
         self.makeSocket = makeSocket
+        self.pongTimeout = pongTimeout
+        self.heartbeatInterval = heartbeatInterval
+    }
+
+    private func cancelHeartbeat() {
+        heartbeat?.cancel()
+        heartbeat = nil
+        probeID = nil
+    }
+
+    private func scheduleHeartbeat() {
+        cancelHeartbeat()
+        guard isForeground, let socket, e2e != nil else { return }
+        heartbeat = Task { [weak self, weak socket, heartbeatInterval] in
+            do { try await Task.sleep(for: heartbeatInterval) } catch { return }
+            guard let self, let socket, self.socket === socket else { return }
+            self.probeSocket()
+        }
+    }
+
+    private func probeSocket() {
+        guard isForeground, let socket, e2e != nil, probeID == nil else { return }
+        heartbeat?.cancel()
+        let id = UUID()
+        probeID = id
+        heartbeat = Task { [weak self, weak socket, pongTimeout] in
+            do { try await Task.sleep(for: pongTimeout) } catch { return }
+            guard let self, let socket, self.probeID == id else { return }
+            self.transportLost(on: socket, message: "连接中断，正在重新连接…")
+        }
+        socket.ping { [weak self, weak socket] error in
+            Task { @MainActor in
+                guard let self, let socket, self.socket === socket, self.probeID == id else { return }
+                if let error { self.transportLost(on: socket, message: error.localizedDescription) }
+                else { self.scheduleHeartbeat() }
+            }
+        }
     }
 
     public func connect() {
@@ -117,14 +169,37 @@ public final class RelayClient: ObservableObject {
     }
 
     public func disconnect() {
+        retry?.cancel()
+        retry = nil
+        closeSocket()
+        lastError = nil
+        state = .idle
+    }
+
+    private func closeSocket() {
+        cancelHeartbeat()
         receiver?.cancel()
         receiver = nil
         socket?.cancel(with: .normalClosure, reason: nil)
         socket = nil
         handshake = nil
         e2e = nil
-        lastError = nil
-        state = .idle
+    }
+
+    private func transportLost(on task: any RelaySocket, message: String) {
+        guard socket === task else { return }
+        // A fresh QR is single-use. Only a saved pairing can resume automatically.
+        if case .pair = handshake { fail(message); return }
+        closeSocket()
+        lastError = message
+        state = .error
+        let delay = reconnectDelay
+        reconnectDelay = min(delay * 2, 30_000_000_000)
+        retry = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) } catch { return }
+            guard let self, !Task.isCancelled, self.isForeground, self.socket == nil else { return }
+            self.connect()
+        }
     }
 
     private func fail(_ message: String) {
@@ -171,22 +246,10 @@ public final class RelayClient: ObservableObject {
                 await handle(object, from: task)
             } catch {
                 guard !Task.isCancelled, socket === task else { return }
-                if case .pair = handshake {
-                    fail(error.localizedDescription)
-                    return
-                }
-                lastError = error.localizedDescription
-                state = .error
-                break
+                transportLost(on: task, message: error.localizedDescription)
+                return
             }
         }
-        guard !Task.isCancelled, socket === task else { return }
-        let delay = reconnectDelay
-        reconnectDelay = min(reconnectDelay * 2, 30_000_000_000)
-        do { try await Task.sleep(nanoseconds: delay) }
-        catch { return }
-        guard !Task.isCancelled, socket === task else { return }
-        connect()
     }
 
     private func finishHandshake(token: String?, on task: any RelaySocket) async {
@@ -205,7 +268,7 @@ public final class RelayClient: ObservableObject {
         // A restarted gateway needs the same public key again for its E2E handshake.
         do { try await sendWire(["type": "pair_pub", "pub": key.publicKey], on: task) }
         catch {
-            if socket === task { fail(error.localizedDescription) }
+            transportLost(on: task, message: error.localizedDescription)
             return
         }
         guard socket === task, !Task.isCancelled else { return }
@@ -218,6 +281,7 @@ public final class RelayClient: ObservableObject {
         lastError = nil
         state = .paired
         reconnectDelay = 1_000_000_000
+        scheduleHeartbeat()
         onPaired?(token)
     }
 
@@ -239,8 +303,16 @@ public final class RelayClient: ObservableObject {
         guard e2e != nil else { return }
         switch type {
         case "status":
-            if object["needsPairingKey"] as? Bool == true {
-                connect()
+            if object["needsPairingKey"] as? Bool == true, let key = e2e {
+                // Only the upstream socket changed. Reuse the paired phone socket and
+                // send its key before the app's read-only recovery requests.
+                do { try await sendWire(["type": "pair_pub", "pub": key.publicKey], on: task) }
+                catch { transportLost(on: task, message: error.localizedDescription); return }
+                guard socket === task else { return }
+                if state == .error {
+                    lastError = nil
+                    state = .paired
+                }
                 return
             }
             if (object["state"] as? String) == "unknown" {
@@ -293,9 +365,14 @@ protocol RelaySocket: AnyObject {
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
     func send(_ message: URLSessionWebSocketTask.Message) async throws
     func receive() async throws -> URLSessionWebSocketTask.Message
+    func ping(_ completion: @escaping @Sendable (Error?) -> Void)
 }
 
-extension URLSessionWebSocketTask: RelaySocket {}
+extension URLSessionWebSocketTask: RelaySocket {
+    func ping(_ completion: @escaping @Sendable (Error?) -> Void) {
+        sendPing(pongReceiveHandler: completion)
+    }
+}
 
 private final class RelaySession: NSObject, URLSessionTaskDelegate {
     static let shared: URLSession = {

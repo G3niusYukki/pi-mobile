@@ -6,6 +6,108 @@ import XCTest
 /// Exercise the production handshake, encrypted wire commands, and app callbacks in memory.
 @MainActor
 final class ModelConnectionTests: XCTestCase {
+    func testLateNativePromptReceiptClearsOnlyItsOwnNotice() async throws {
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
+        f.app.draft = "slow question"
+        XCTAssertTrue(f.app.send())
+        let prompt = try await f.next("prompt")
+        await f.delta("Working")
+        let probe = try await f.next("get_state") // Only issued after the prompt deadline.
+        XCTAssertEqual(probe["promptReceiptIds"] as? [String], [try XCTUnwrap(prompt["id"] as? String)])
+        XCTAssertNotNil(f.app.errorMessage)
+        await f.state(probe, model: "a") // Legacy gateway, no receipts.
+        let unknown = try XCTUnwrap(f.app.pendingDeliveryNotice)
+        XCTAssertEqual(f.app.errorMessage, unknown)
+        await f.delta(" more")
+        XCTAssertEqual(f.app.errorMessage, unknown)
+        f.app.stop()
+        await f.reply(try await f.next("abort"), error: "Fixture stop rejected")
+        XCTAssertNil(f.app.pendingDeliveryNotice)
+        XCTAssertEqual(f.app.errorMessage, "Fixture stop rejected")
+        f.app.clearError()
+        XCTAssertEqual(f.app.pendingDeliveryNotice, unknown)
+        f.app.stop()
+        await f.reply(try await f.next("abort"), error: "Fixture stop rejected")
+        await f.reply(prompt, data: ["disposition": "started"])
+        XCTAssertNil(f.app.pendingDeliveryNotice)
+        XCTAssertEqual(f.app.errorMessage, "Fixture stop rejected")
+        f.app.clearError()
+        XCTAssertNil(f.app.errorMessage)
+        XCTAssertTrue(f.app.messages.contains { $0.text == "slow question" })
+        XCTAssertTrue(f.app.draft.isEmpty)
+        f.app.resume()
+        let after = try await f.next("get_state")
+        XCTAssertTrue((after["promptReceiptIds"] as? [String] ?? []).isEmpty)
+        XCTAssertFalse(f.socket.commands.contains { $0["type"] as? String == "prompt" })
+    }
+
+    func testReconnectedIdenticalSteersUseOnlyRequestedReceiptsAndKeepNewDraft() async throws {
+        let path = "/fixture/receipts.jsonl"
+        let f = try await SessionFixture.ready(path: path)
+        f.app.draft = "same"
+        XCTAssertTrue(f.app.send())
+        let first = try await f.next("prompt")
+        let firstID = try XCTUnwrap(first["id"] as? String)
+        f.app.draft = "same"
+        XCTAssertTrue(f.app.send())
+        let second = try await f.next("prompt")
+        let secondID = try XCTUnwrap(second["id"] as? String)
+        XCTAssertNotEqual(firstID, secondID)
+        let users = f.app.messages.filter { $0.text == "same" }.map(\.id)
+        XCTAssertEqual(users.count, 2)
+        f.app.reconnect()
+        await f.handshake()
+        let probe = try await f.next("get_state")
+        XCTAssertEqual(Set(probe["promptReceiptIds"] as? [String] ?? []), [firstID, secondID])
+        await f.history(try await f.next("session_history"), path: path, items: [f.savedQuestion])
+        await f.state(probe, model: "a", path: path)
+        XCTAssertNotNil(f.app.errorMessage, "A legacy state response does not prove acceptance")
+        XCTAssertEqual(f.app.messages.filter { $0.text == "same" }.map(\.id), users)
+        await f.event(["type": "agent_start", "sessionPath": path])
+        await f.event(["type": "message_start", "message": ["role": "user", "content": "same"]])
+        XCTAssertNotNil(f.app.errorMessage)
+        f.app.resume()
+        let latest = try await f.next("get_state")
+        await f.reply(probe, data: ["isStreaming": true, "sessionFile": path,
+                                   "promptReceipts": [["id": firstID, "success": false, "error": "stale snapshot"]]])
+        await f.reply(latest, data: ["isStreaming": true, "sessionFile": path, "promptReceipts": [
+            ["id": firstID, "success": true, "data": ["disposition": "queued"]],
+            ["id": "unsolicited", "success": false, "error": "wrong ID"], ["id": secondID]]])
+        XCTAssertNotNil(f.app.errorMessage, "The other steer still needs its own result")
+        XCTAssertTrue(f.app.draft.isEmpty)
+        f.app.draft = "new draft"
+        f.app.resume()
+        let final = try await f.next("get_state")
+        XCTAssertEqual(final["promptReceiptIds"] as? [String], [secondID])
+        let rejection = ["isStreaming": false, "sessionFile": path, "promptReceipts": [
+            ["id": secondID, "success": false, "error": "Fixture steer rejected"]]] as [String: Any]
+        await f.reply(final, data: rejection)
+        await f.reply(second, error: "Duplicate rejection")
+        XCTAssertEqual(f.app.draft, "same\nnew draft")
+        XCTAssertEqual(f.app.errorMessage, "Fixture steer rejected")
+        XCTAssertEqual(f.app.messages.filter { $0.text == "same" }.map(\.id), [users[0]])
+        XCTAssertFalse(f.socket.commands.contains { $0["type"] as? String == "prompt" })
+    }
+
+    func testPromptReceiptFromPreviousConversationCannotRestoreItsText() async throws {
+        let f = try await SessionFixture.ready(path: "/fixture/old.jsonl")
+        f.app.draft = "old draft"
+        XCTAssertTrue(f.app.send())
+        let prompt = try await f.next("prompt")
+        let id = try XCTUnwrap(prompt["id"] as? String)
+        f.app.switchSession("/fixture/new.jsonl")
+        await f.reply(try await f.next("switch_session"))
+        await f.history(try await f.next("session_history"), path: "/fixture/new.jsonl", items: [f.savedQuestion])
+        let state = try await f.next("get_state")
+        XCTAssertFalse((state["promptReceiptIds"] as? [String] ?? []).contains(id))
+        f.app.draft = "here"
+        await f.reply(state, data: ["isStreaming": false, "sessionFile": "/fixture/new.jsonl",
+                                    "promptReceipts": [["id": id, "success": false, "error": "old failure"]]])
+        await f.reply(prompt, error: "old failure")
+        XCTAssertEqual(f.app.draft, "here")
+        XCTAssertNil(f.app.errorMessage)
+    }
+
     func testStreamingDuringAStateRefreshKeepsChatClearAndAcceptsTheLateReply() async throws {
         let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
         f.app.draft = "a slow answer"
@@ -521,6 +623,7 @@ private final class CommandSocket: RelaySocket {
     var key: E2EKey?
     var commands: [[String: Any]] = []
     func resume() {}
+    func ping(_ completion: @escaping @Sendable (Error?) -> Void) { completion(nil) }
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
     func receive() async throws -> URLSessionWebSocketTask.Message {
         try await Task.sleep(for: .seconds(60))

@@ -16,7 +16,13 @@ final class AppModel: ObservableObject {
     @Published private var stateReadError: StateReadError?
     @Published private var historyReadError: String?
     @Published private(set) var settingError: String?
-    var errorMessage: String? { connectionError ?? settingError ?? actionError ?? historyReadError ?? stateReadError?.message }
+    @Published private var promptError: String?
+    @Published private var unconfirmedPromptNotice: String?
+    private var failureMessage: String? {
+        connectionError ?? settingError ?? actionError ?? promptError ?? historyReadError ?? stateReadError?.message
+    }
+    var pendingDeliveryNotice: String? { isConnected && failureMessage == nil ? unconfirmedPromptNotice : nil }
+    var errorMessage: String? { failureMessage ?? pendingDeliveryNotice }
     @Published var showConversation = false
     @Published var focusComposer = false
     @Published var draft = ""
@@ -51,6 +57,24 @@ final class AppModel: ObservableObject {
     private var queuedSession: SessionDestination?
     private var requests: [String: RequestKind] = [:]
     private var deadlines: [String: Task<Void, Never>] = [:]
+    private var dismissedPromptIDs = Set<String>()
+    private var deferredPromptReceipts: [String: PromptReceipt] = [:]
+
+    private struct PromptReceipt {
+        let id: String
+        let success: Bool
+        let disposition: String?
+        let error: String?
+
+        init?(_ object: [String: Any]) {
+            guard let id = object["id"] as? String, let success = object["success"] as? NSNumber,
+                  CFGetTypeID(success) == CFBooleanGetTypeID() else { return nil }
+            self.id = id
+            self.success = success.boolValue
+            disposition = (object["data"] as? [String: Any])?["disposition"] as? String
+            error = object["error"] as? String
+        }
+    }
 
     private enum SessionDestination: Equatable {
         case new, existing(String)
@@ -81,7 +105,7 @@ final class AppModel: ObservableObject {
     }
 
     private enum RequestKind {
-        case state(refreshHistory: Bool), history, models, catalog, prompt, sessionChange(SessionDestination), setting, command
+        case state(refreshHistory: Bool, promptReceiptIDs: Set<String>), history, models, catalog, prompt, sessionChange(SessionDestination), setting, command
     }
 
     convenience init() { self.init(client: RelayClient()) }
@@ -126,10 +150,13 @@ final class AppModel: ObservableObject {
     }
 
     func resume() {
+        client.setForeground(true)
         guard isPaired else { return }
         if client.isConnected { refreshConversation() }
         else { client.connectIfNeeded() }
     }
+
+    func suspendConnectionChecks() { client.setForeground(false) }
 
     func reconnect() {
         client.connect()
@@ -167,9 +194,14 @@ final class AppModel: ObservableObject {
     func dismissSettingError() { settingError = nil }
 
     func clearError() {
+        if pendingDeliveryNotice != nil {
+            dismissedPromptIDs.formUnion(conversation.unconfirmedPromptIDs)
+            unconfirmedPromptNotice = nil
+        }
         connectionError = nil
         settingError = nil
         actionError = nil
+        promptError = nil
         stateReadError = nil
         historyReadError = nil
     }
@@ -264,8 +296,10 @@ final class AppModel: ObservableObject {
         guard settingInFlight == nil, queuedSession == nil else { return false }
         let id = nextID("prompt")
         guard let command = conversation.preparePrompt(id: id, text: text, image: image, connected: client.isConnected) else {
-            if client.isConnected { actionError = "请等待会话加载完成后发送" }
-            else {
+            if client.isConnected {
+                if !conversation.hasPromptCapacity { promptError = "已有 \(ConversationState.promptReceiptLimit) 条消息等待确认，草稿已保留。" }
+                else { actionError = "请等待会话加载完成后发送" }
+            } else {
                 connectionError = "连接已断开，草稿已保留，请连接后发送"
                 client.connectIfNeeded()
             }
@@ -450,8 +484,11 @@ final class AppModel: ObservableObject {
         var reconcile = false
         switch kind {
         case .prompt:
-            conversation.abandonPrompt(id: id)
-            reconcile = true
+            guard conversation.hasPendingPrompt(id: id) else { return }
+            conversation.markPromptUnconfirmed(id: id)
+            publishConversation()
+            requestState(refreshHistory: true)
+            return
         case .sessionChange:
             _ = conversation.failRequest(id: id, outcomeUnknown: outcomeUnknown)
             // Do not dispatch a queued transition when the preceding result is unknown.
@@ -481,7 +518,7 @@ final class AppModel: ObservableObject {
         // A prompt invalidates the transcript snapshot but still needs its settings.
         // Supersede every older state read, including those no longer owned by the transcript.
         for (id, kind) in requests {
-            if case .state(let previousRefresh) = kind {
+            if case .state(let previousRefresh, _) = kind {
                 needsHistory = needsHistory || previousRefresh
                 finishRequest(id)
             }
@@ -491,7 +528,9 @@ final class AppModel: ObservableObject {
         var command: [String: Any] = ["type": "get_state", "id": id]
         if let pending = conversation.pendingChange { command["afterSessionChangeId"] = pending.id }
         if recoveringSetting { command["afterSettingChangeId"] = settingInFlight?.id }
-        sendRPC(command, kind: .state(refreshHistory: needsHistory), failure: "获取状态失败")
+        let ids = conversation.canSend ? conversation.unconfirmedPromptIDs : []
+        if !ids.isEmpty { command["promptReceiptIds"] = ids }
+        sendRPC(command, kind: .state(refreshHistory: needsHistory, promptReceiptIDs: Set(ids)), failure: "获取状态失败")
     }
 
     private func requestModels() {
@@ -523,8 +562,34 @@ final class AppModel: ObservableObject {
 
     // MARK: - 响应投影
 
+    private func applyPromptReceipt(_ receipt: PromptReceipt) {
+        guard conversation.hasPendingPrompt(id: receipt.id) else { return }
+        // A switch may be cancelled. Hold its old conversation's result until the visible destination is known.
+        guard conversation.canSend else {
+            deferredPromptReceipts[receipt.id] = deferredPromptReceipts[receipt.id] ?? receipt
+            return
+        }
+        let restored = conversation.resolvePrompt(id: receipt.id, success: receipt.success, disposition: receipt.disposition)
+        if let restored {
+            if !restored.isEmpty { draft = draft.isEmpty ? restored : restored + "\n" + draft }
+            promptError = receipt.error ?? "Mac 未能接收这条消息"
+        }
+    }
+
     private func applyResponse(_ response: [String: Any]) {
-        guard let id = response["id"] as? String, let kind = requests[id] else { return }
+        guard let id = response["id"] as? String else { return }
+        // Deadlines only end the wait. An encrypted reply to this exact prompt is still authoritative.
+        if conversation.hasPendingPrompt(id: id) {
+            guard response["command"] == nil || response["command"] as? String == "prompt",
+                  let receipt = PromptReceipt(response) else { return }
+            finishRequest(id)
+            if receipt.success { clearStateTimeout() }
+            applyPromptReceipt(receipt)
+            publishConversation()
+            return
+        }
+        guard let kind = requests[id] else { return }
+        if case .prompt = kind { finishRequest(id); return } // The conversation was replaced.
         let success = response["success"] as? Bool == true
         let data = response["data"] as? [String: Any]
         if success {
@@ -547,10 +612,6 @@ final class AppModel: ObservableObject {
                     legacyCatalog = true
                     loadSessions()
                     return
-                }
-            case .prompt:
-                if let restored = conversation.resolvePrompt(id: id, success: false) {
-                    draft = draft.isEmpty ? restored : restored + "\n" + draft
                 }
             case .sessionChange:
                 _ = conversation.resolveSessionChange(id: id, success: false)
@@ -577,9 +638,7 @@ final class AppModel: ObservableObject {
         case .models:
             finishRequest(id)
             models = PiProjection.modelOptions(from: response["data"])
-        case .prompt:
-            finishRequest(id)
-            _ = conversation.resolvePrompt(id: id, success: true, disposition: data?["disposition"] as? String)
+        case .prompt: return
         case .sessionChange(let destination):
             finishRequest(id)
             let cancelled = data?["cancelled"] as? Bool == true
@@ -601,7 +660,7 @@ final class AppModel: ObservableObject {
                 actionError = "切换会话已取消"
                 refreshConversation()
             }
-        case .state(let refreshHistory):
+        case .state(let refreshHistory, let requestedPromptIDs):
             guard let data, let streaming = data["isStreaming"] as? Bool else {
                 requestFailed(id: id, message: "状态响应无效", outcomeUnknown: false)
                 return
@@ -627,6 +686,13 @@ final class AppModel: ObservableObject {
             applyModelState(data)
             if settingInFlight == nil, continueQueuedSession() { return }
             guard appliesToTranscript else { publishConversation(); return }
+            if conversation.canSend, path == conversation.sessionPath, !requestedPromptIDs.isEmpty,
+               let receipts = data["promptReceipts"] as? [[String: Any]] {
+                for object in receipts.prefix(ConversationState.promptReceiptLimit) {
+                    guard let receipt = PromptReceipt(object), requestedPromptIDs.contains(receipt.id) else { continue }
+                    applyPromptReceipt(receipt)
+                }
+            }
             // Empty native sessions have a future path before the file is created.
             let hasHistory = data["messageCount"] as? Int != 0
             if (refreshHistory || !conversation.isSessionReady), hasHistory, let path, conversation.pendingHistoryID == nil {
@@ -695,8 +761,22 @@ final class AppModel: ObservableObject {
     }
 
     private func publishConversation() {
+        if conversationID != conversation.conversationID {
+            conversationID = conversation.conversationID
+            promptError = nil
+        }
+        for (id, receipt) in deferredPromptReceipts {
+            if conversation.canSend || !conversation.hasPendingPrompt(id: id) {
+                deferredPromptReceipts.removeValue(forKey: id)
+                applyPromptReceipt(receipt)
+            }
+        }
+        let unknown = Set(conversation.unconfirmedPromptIDs)
+        dismissedPromptIDs.formIntersection(unknown)
+        let count = unknown.subtracting(dismissedPromptIDs).count
+        let notice = conversation.canSend && count > 0 ? "正在等待 Mac 确认 \(count) 条消息，请勿重复发送。" : nil
+        if unconfirmedPromptNotice != notice { unconfirmedPromptNotice = notice }
         if runPhase != conversation.runPhase { runPhase = conversation.runPhase }
-        if conversationID != conversation.conversationID { conversationID = conversation.conversationID }
         if messages != conversation.messages { messages = conversation.messages }
         if selectedSessionPath != conversation.sessionPath {
             selectedSessionPath = conversation.sessionPath

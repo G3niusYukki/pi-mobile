@@ -9,6 +9,58 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertFalse(state.isRunning)
     }
 
+    func testDisconnectKeepsUnknownPhotoAndAcceptsItsExactLateRejection() throws {
+        var state = loadedState()
+        let photo = Data([1, 2, 3])
+        _ = try XCTUnwrap(state.preparePrompt(id: "photo", text: "caption", image: photo, connected: true))
+        let row = try XCTUnwrap(state.messages.last { $0.role == .user })
+        state.disconnected()
+        state.beginStateRequest(id: "idle")
+        XCTAssertTrue(state.receiveState(id: "idle", path: "/a", running: false))
+        state.beginHistory(id: "h", path: "/a")
+        XCTAssertTrue(state.receiveHistory(id: "h", path: "/a", items: [item("a", "user", "A")]))
+        XCTAssertEqual(state.messages.first { $0.id == row.id }?.attachments, row.attachments)
+        XCTAssertNil(state.resolvePrompt(id: "other", success: false))
+        XCTAssertEqual(state.resolvePrompt(id: "photo", success: false), "caption")
+        XCTAssertFalse(state.messages.contains { $0.id == row.id })
+        XCTAssertNil(state.resolvePrompt(id: "photo", success: false))
+    }
+
+    func testRejectedPromptKeepsIndependentlySavedIdenticalHistory() throws {
+        let bytes = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGM4UCDxHwAFhAJIWblWNgAAAABJRU5ErkJggg=="))
+        let hint = "[Image: original 2853x2007, displayed at 2000x1407. Multiply coordinates by 1.43 to map to original image.]"
+        for image in [nil, bytes] {
+            var state = loadedState()
+            _ = try XCTUnwrap(state.preparePrompt(id: "phone", text: "same", image: image, connected: true))
+            let localID = try XCTUnwrap(state.messages.last { $0.role == .user }?.id)
+            state.disconnected()
+            state.beginHistory(id: "h", path: "/a")
+            let savedText = image == nil ? "same" : "same\n\n" + hint
+            let history = [item("a", "user", "A"), item("desktop", "user", savedText)]
+            XCTAssertTrue(state.receiveHistory(id: "h", path: "/a", items: history))
+            XCTAssertEqual(state.unconfirmedPromptIDs, ["phone"])
+            XCTAssertEqual(state.resolvePrompt(id: "phone", success: false), "same")
+            let saved = try XCTUnwrap(state.messages.first { $0.sourceID == "desktop" })
+            XCTAssertNotEqual(saved.id, localID)
+            XCTAssertEqual(saved.text, "same")
+            XCTAssertEqual(saved.attachments.count, image == nil ? 0 : 1)
+            XCTAssertNil(saved.attachments.first?.data, "A desktop placeholder must not display the rejected phone photo")
+        }
+    }
+
+    func testBoundedPendingPromptsReleaseCapacityOnlyOnAnExactReceipt() {
+        var state = ConversationState()
+        for index in 0..<32 {
+            XCTAssertNotNil(state.preparePrompt(id: "p\(index)", text: "same", connected: true))
+        }
+        state.disconnected()
+        XCTAssertNil(state.preparePrompt(id: "overflow", text: "keep draft", connected: true))
+        XCTAssertEqual(state.messages.filter { $0.role == .user }.count, 32)
+        XCTAssertEqual(state.resolvePrompt(id: "p12", success: false), "same")
+        XCTAssertNotNil(state.preparePrompt(id: "available", text: "keep draft", connected: true))
+        XCTAssertEqual(state.messages.filter { $0.role == .user }.count, 32)
+    }
+
     func testBusyPromptUsesSteeringWithoutReplacingActiveAssistant() throws {
         var state = ConversationState()
         let first = try XCTUnwrap(state.preparePrompt(id: "p1", text: "first", connected: true))

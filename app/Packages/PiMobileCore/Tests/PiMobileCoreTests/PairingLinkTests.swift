@@ -147,6 +147,131 @@ final class PairingLinkTests: XCTestCase {
         XCTAssertFalse(io.client().hasPairing)
     }
 
+    @MainActor
+    func testForegroundChecksReplaceAHalfOpenSocketWithoutReplayingAnRPC() async throws {
+        let io = PairingFixture()
+        let client = io.client(pongTimeout: .milliseconds(150))
+        defer { client.disconnect() }
+        let token = String(repeating: "c", count: 64)
+        client.pair(token: "https://relay.example/pi/pair#" + fragment)
+        await client.handle(["type": "paired", "deviceToken": token])
+        let first = try XCTUnwrap(io.sockets.last)
+        var oldPong: (@Sendable (Error?) -> Void)?
+        first.onPing = { oldPong = $0 }
+        let replaced = expectation(description: "resume using the saved credential")
+        io.didOpen = { replaced.fulfill() }
+        client.setForeground(false)
+        client.setForeground(true)
+        await fulfillment(of: [replaced], timeout: 2)
+        let second = try XCTUnwrap(io.sockets.last)
+        XCTAssertFalse(second === first)
+        XCTAssertTrue(first.cancelled)
+        XCTAssertEqual(io.requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer " + token)
+        await client.handle(["type": "paired", "deviceToken": token])
+        oldPong?(URLError(.networkConnectionLost))
+        await Task.yield()
+        XCTAssertTrue(client.isConnected)
+        XCTAssertFalse(second.cancelled, "A callback from the old socket must not close the replacement")
+        XCTAssertEqual(second.frames.compactMap { $0["type"] }, ["pair_pub"])
+    }
+
+    @MainActor
+    func testHealthyAndBackgroundSocketsSurviveForegroundChecks() async throws {
+        let io = PairingFixture()
+        let client = io.client(pongTimeout: .milliseconds(150))
+        defer { client.disconnect() }
+        client.pair(token: "https://relay.example/pi/pair#" + fragment)
+        await client.handle(["type": "paired", "deviceToken": String(repeating: "c", count: 64)])
+        let first = try XCTUnwrap(io.sockets.last)
+        let pinged = expectation(description: "one foreground ping for repeated activation")
+        var pending: (@Sendable (Error?) -> Void)?
+        first.onPing = { pending = $0; pinged.fulfill() }
+        client.setForeground(false)
+        client.setForeground(true)
+        client.setForeground(true)
+        await fulfillment(of: [pinged], timeout: 1)
+        client.setForeground(false)
+        pending?(URLError(.networkConnectionLost)) // A late result after backgrounding is stale.
+        let pingedAgain = expectation(description: "probe the same connection on return")
+        first.onPing = { complete in complete(nil); pingedAgain.fulfill() }
+        client.setForeground(true)
+        await fulfillment(of: [pingedAgain], timeout: 1)
+        let noReplace = expectation(description: "responsive socket kept")
+        noReplace.isInverted = true
+        io.didOpen = { noReplace.fulfill() }
+        await fulfillment(of: [noReplace], timeout: 0.25)
+        XCTAssertTrue(client.isConnected)
+        XCTAssertFalse(first.cancelled)
+    }
+
+    @MainActor
+    func testQuietConnectionLostWhileChatStaysOpenRecoversOnItsOwn() async throws {
+        let io = PairingFixture()
+        let client = io.client(pongTimeout: .milliseconds(120), heartbeatInterval: .milliseconds(100))
+        defer { client.disconnect() }
+        let token = String(repeating: "b", count: 64)
+        client.pair(token: "https://relay.example/pi/pair#" + fragment)
+        await client.handle(["type": "paired", "deviceToken": token])
+        let first = try XCTUnwrap(io.sockets.last)
+        first.onPing = { _ in } // receive() is still suspended and the radio silently lost the stream.
+        let resumed = expectation(description: "recover an idle stream while still foreground")
+        io.didOpen = { resumed.fulfill() }
+        await fulfillment(of: [resumed], timeout: 2)
+        XCTAssertTrue(first.cancelled)
+        XCTAssertEqual(io.requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer " + token)
+    }
+
+    @MainActor
+    func testGatewayReturningRenewsEncryptionOnTheExistingPhoneSocket() async throws {
+        let io = PairingFixture()
+        let client = io.client()
+        defer { client.disconnect() }
+        client.pair(token: "https://relay.example/pi/pair#" + fragment)
+        await client.handle(["type": "paired", "deviceToken": String(repeating: "a", count: 64)])
+        let phone = try XCTUnwrap(io.sockets.last)
+        let publicKey = try XCTUnwrap(phone.frames.last?["pub"])
+        await client.handle(["type": "status", "state": "unknown"])
+        XCTAssertFalse(client.isConnected)
+        // Both relay and gateway may independently announce the same recovery.
+        var restorations = 0
+        var connected = false
+        client.onConnectionChange = { _, _ in
+            let next = client.isConnected
+            if !connected && next { restorations += 1 }
+            connected = next
+        }
+        for _ in 0..<2 {
+            await client.handle(["type": "status", "state": "idle", "needsPairingKey": true])
+        }
+        XCTAssertEqual(io.sockets.count, 1, "An upstream reconnect must not interrupt the downstream socket")
+        XCTAssertFalse(phone.cancelled)
+        XCTAssertEqual(phone.frames.last, ["type": "pair_pub", "pub": publicKey])
+        XCTAssertGreaterThan(phone.frames.filter { $0["type"] == "pair_pub" }.count, 1)
+        XCTAssertEqual(restorations, 1)
+        XCTAssertTrue(client.isConnected)
+    }
+
+    @MainActor
+    func testLostPublicKeyWriteDuringResumeRetriesTheSavedPairing() async throws {
+        let io = PairingFixture()
+        let client = io.client()
+        defer { client.disconnect() }
+        let token = String(repeating: "a", count: 64)
+        client.pair(token: "https://relay.example/pi/pair#" + fragment)
+        await client.handle(["type": "paired", "deviceToken": token])
+        let saved = try XCTUnwrap(io.saved)
+        client.connect()
+        io.sockets.last?.onPairPub = { throw URLError(.networkConnectionLost) }
+        let resumed = expectation(description: "retry resume after the network drops during handshake")
+        io.didOpen = { resumed.fulfill() }
+        await client.handle(["type": "paired", "deviceToken": token])
+        await fulfillment(of: [resumed], timeout: 2)
+        XCTAssertEqual(io.saved, saved)
+        XCTAssertEqual(io.requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer " + token)
+        await client.handle(["type": "paired", "deviceToken": token])
+        XCTAssertTrue(client.isConnected)
+    }
+
     func testKeyAgreementRejectsLowOrderGatewayKey() {
         let lowOrder = String(repeating: "A", count: 43)
         XCTAssertNil(E2EKey(gatewayPublicKey: lowOrder))
@@ -161,16 +286,19 @@ private final class PairingFixture {
     var requests: [URLRequest] = []
     var sockets: [TestRelaySocket] = []
 
-    func client(endpoint: String? = nil) -> RelayClient {
+    var didOpen: (() -> Void)?
+
+    func client(endpoint: String? = nil, pongTimeout: Duration = .seconds(8), heartbeatInterval: Duration = .seconds(20)) -> RelayClient {
         let store = PairingStore(read: { self.saved }, write: { value in
             guard self.allowWrite else { return false }
             self.saved = value
             return true
         }, clear: { self.saved = nil })
-        return RelayClient(endpoint: endpoint, store: store) { request in
+        return RelayClient(endpoint: endpoint, store: store, pongTimeout: pongTimeout, heartbeatInterval: heartbeatInterval) { request in
             let socket = TestRelaySocket()
             self.requests.append(request)
             self.sockets.append(socket)
+            self.didOpen?()
             return socket
         }
     }
@@ -180,10 +308,15 @@ private final class PairingFixture {
 private final class TestRelaySocket: RelaySocket {
     var frames: [[String: String]] = []
     var didSend: (([String: String]) -> Void)?
-    var onPairPub: (() async -> Void)?
+    var onPairPub: (() async throws -> Void)?
+    var onPing: ((@escaping @Sendable (Error?) -> Void) -> Void)?
+    var cancelled = false
 
     func resume() {}
-    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) { cancelled = true }
+    func ping(_ completion: @escaping @Sendable (Error?) -> Void) {
+        if let onPing { onPing(completion) } else { completion(nil) }
+    }
     func send(_ message: URLSessionWebSocketTask.Message) async throws {
         guard case let .string(text) = message,
               let frame = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: String] else {
@@ -192,7 +325,7 @@ private final class TestRelaySocket: RelaySocket {
         }
         frames.append(frame)
         didSend?(frame)
-        if frame["type"] == "pair_pub" { await onPairPub?() }
+        if frame["type"] == "pair_pub" { try await onPairPub?() }
     }
     func receive() async throws -> URLSessionWebSocketTask.Message {
         try await Task.sleep(nanoseconds: 60_000_000_000)

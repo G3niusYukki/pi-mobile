@@ -1,5 +1,6 @@
 // Pi 1.5.2 的 RPC 测试替身（docs/rpc-commands.md / dist/modes/rpc/rpc-mode.js）。
 // 保持运行到 abort / 会话切换，方便确定性测试 busy prompt；不调用真实模型。
+import { watch } from "node:fs"
 import { dirname, join } from "node:path"
 
 process.stdin.setEncoding("utf8")
@@ -31,6 +32,26 @@ async function handle(cmd) {
       pendingConfirmations.delete(cmd.id)
       break
     case "prompt":
+      if (cmd.message === "fixture child exits before ACK") process.exit(23)
+      if (cmd.message === "fixture pending without ACK") break
+      if (!isStreaming && cmd.message === "fixture gated preflight") {
+        isStreaming = true
+        await new Promise(resolve => {
+          const gate = watch(process.cwd(), (_, name) => {
+            if (name !== "release-preflight") return
+            gate.close()
+            resolve()
+          })
+          output({ type: "extension_ui_request", id: "preflight-gate", method: "confirm" })
+        })
+        reply({ disposition: "started", internalField: "fixture-only" })
+        process.stderr.write("fixture preflight completed\n")
+        break
+      }
+      if (cmd.message === "fixture old Pi ACK") {
+        reply()
+        break
+      }
       if (isStreaming) {
         if (!cmd.streamingBehavior) {
           fail("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.")
@@ -75,7 +96,8 @@ async function handle(cmd) {
       reply({ messages: [lastUserPhoto ?? { role: "assistant", content: [{ type: "thinking", thinking: "fixture-private" }, { type: "text", text: "answer" }] }] })
       break
     case "get_state":
-      if (Object.hasOwn(cmd, "afterSettingChangeId")) fail("Gateway-only field reached Pi")
+      if (Object.hasOwn(cmd, "afterSettingChangeId") || Object.hasOwn(cmd, "promptReceiptIds")) fail("Gateway-only field reached Pi")
+      else if (process.env.FAKE_PI_FAIL_GET_STATE === "1") fail("fixture state hook failed")
       else reply({ isStreaming, isCompacting: false, sessionFile, pendingMessageCount, model, thinkingLevel })
       break
     case "set_model":

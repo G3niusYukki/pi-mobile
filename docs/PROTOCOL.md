@@ -13,8 +13,8 @@
 1. gateway 用 `Authorization: Bearer <GATEWAY_TOKEN>` 连 `wss://relay.example.com/pi/gateway`。
 2. gateway 发 `{"type":"pair_create"}`；relay 回 `{"type":"pair_token","token":"<32 hex>","expiresAt":...}`（TTL 5 分钟，单用）。Mac 把它显示成二维码/文本。
 3. client 从 `https://relay.example.com/pi/pair#<token>.<gatewayPub>` 导出同源 `wss://relay.example.com/pi/client`，首帧发送 `{"type":"pair","token":"…","pub":"<clientPub>"}`。relay 校验后发回 `{"type":"paired","deviceToken":"<64 hex>"}`，并把客户端公钥转交给 gateway。
-4. 之后 client 用 `Authorization: Bearer <deviceToken>` 连 `/pi/client`，relay 直接放行并把缓存的状态快照推给它。
-5. 一条 relay 同时只允许一个 gateway 和一个 device；重复连接踢掉旧连接。
+4. 之后 client 用 `Authorization: Bearer <deviceToken>` 连 `/pi/client`。relay 返回配对确认和 gateway 在线状态，手机再从 Mac 读取当前会话状态与历史。
+5. 同一 relay 同时容纳一个 gateway 和一个 device。gateway 重连时，手机在已有 WebSocket 上响应 `needsPairingKey`，重新发送配对公钥。手机在前台每 20 秒检查一次连接，回到前台时立即检查。8 秒内未收到 pong 会触发重连。退入后台后暂停探测。
 
 ## 消息
 
@@ -44,6 +44,7 @@ gateway → client：
 以下是端到端加密载荷内的命令；线上通过 `sealed` 传输。
 
 - `prompt` 始终携带 `streamingBehavior: "steer"`，因此在 Pi 已开始回复的竞态下也能接受补充消息。客户端保留当前流式回复的身份，并按响应的 `disposition` 处理开始、排队或直接完成的命令。
+- 发送超过 15 秒仍在等待回执时，客户端保留原 `prompt.id`。连接恢复后，`get_state` 可以附带 `promptReceiptIds` 查询最多 32 条消息。网关在 `data.promptReceipts` 中返回已收到的原生回执，每项包含 `id`、`success` 和可选的 `data.disposition` 或 `error`。只有该消息的回执能确认发送结果，恢复流程只读。网关在内存中为当前配对公钥保留最近 128 条回执，更换公钥或重启会清空。空结果或旧网关缺少该字段时，消息继续显示待确认。
 - 客户端使用带唯一 `id` 的原生 `switch_session` / `new_session`，收到成功且未 `cancelled` 的响应后才加载目标历史。切换中的超时不会被当作失败重放；结果不明时暂停新的发送与切换，保留原请求身份供重连核对。
 - 恢复时发送 `get_state`，可携带 `afterSessionChangeId`。网关等待已接收的原生会话变更全部响应后再读取状态，返回 `data.sessionBarrier: true` 与相同的 `sessionBarrierId`。客户端只用匹配的屏障或原生响应结束不确定的切换。扩展 UI 审批回复仍直接转发，避免等待审批的切换被锁住。此恢复能力需要 App 与网关同时更新。
 - 模型与思考强度共用一个写入队列。客户端按原生响应确认设置，恢复时可在 `get_state` 中携带 `afterSettingChangeId`。当前网关等已收到的 `set_model` / `set_thinking_level` 得到 Pi 的响应，再读取实际设置并回传相同的 `data.settingBarrierId`。旧网关没有这个字段时，客户端等待原请求响应或读到与请求一致的设置。
