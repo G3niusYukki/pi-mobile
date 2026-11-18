@@ -234,7 +234,8 @@ struct ConversationScreen: View {
                 .padding(.horizontal, 20)
                 .padding(.vertical, 8)
             }
-            ConversationTimeline(storageKey: timelineKey, messageIDs: rows.map(\.id), isLoading: model.isLoadingHistory) {
+            ConversationTimeline(storageKey: timelineKey, messageIDs: rows.map(\.id), isLoading: model.isLoadingHistory,
+                                 submittedPromptID: tab == .chat ? model.submittedPromptID : nil) {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if rows.isEmpty, !model.isLoadingHistory {
                         if tab == .trace {

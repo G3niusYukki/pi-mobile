@@ -61,6 +61,36 @@ final class WhalenessInterfaceTests: XCTestCase {
         XCTAssertNil(model.selectedSessionPath)
     }
 
+    func testSendingFromHistoryFollowsTheNewPromptAndEveryGrowingReply() async throws {
+        let path = "/fixture/scroll.jsonl"
+        let history = (0..<45).map { ["id": "old-\($0)", "role": "user", "text": "历史消息 \($0)"] }
+        let fixture = try await SessionFixture.ready(path: path, history: history)
+        let store = ConversationScrollStore()
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let size = scene.effectiveGeometry.coordinateSpace.bounds.size
+        store.save(.init(offset: 180, width: size.width, followsLatest: false), for: "\(path):chat")
+        let host = try await host(NavigationStack { ConversationScreen(onSettings: {}) }
+            .modifier(AppFontScope()).environmentObject(fixture.app).environmentObject(store)
+            .environment(\.scenePhase, .active), size: size, style: .light)
+        let scroll = try XCTUnwrap(verticalScroll(in: host.view))
+        func gap() -> CGFloat { scroll.contentSize.height + scroll.adjustedContentInset.bottom - scroll.bounds.height - scroll.contentOffset.y }
+        XCTAssertGreaterThan(gap(), 500, "Start with the reader well above the tail of the conversation")
+        fixture.app.draft = "继续讲讲这条路线。"
+        XCTAssertTrue(fixture.app.send())
+        await fixture.reply(try await fixture.next("prompt"), data: ["disposition": "started"])
+        try await eventually { abs(gap()) < 5 }
+        for batch in 1...4 {
+            let height = scroll.contentSize.height
+            await fixture.delta("\n\n## 第 \(batch) 段\n\n" + String(repeating: "沿河堤继续骑行，过桥后靠右。\n", count: 18))
+            try await eventually { scroll.contentSize.height > height + 150 && abs(gap()) < 5 }
+        }
+    }
+
+    private func verticalScroll(in view: UIView) -> UIScrollView? {
+        if let scroll = view as? UIScrollView, scroll.alwaysBounceVertical { return scroll }
+        return view.subviews.lazy.compactMap { self.verticalScroll(in: $0) }.first
+    }
+
     func testCatalogArrivingAfterHistoryUpdatesTheOpenConversationTitle() async {
         let model = await fixtureModel()
         model.selectedSessionTitle = "当前会话"
@@ -85,6 +115,30 @@ final class WhalenessInterfaceTests: XCTestCase {
         try await eventually { measurement.height > initial * 1.3 }
         UserDefaults.standard.set(true, forKey: AppFontScale.followsSystemKey)
         try await eventually { abs(measurement.height - initial) < 2 }
+    }
+
+    func testGrowingReplyKeepsItsLastLineAboveTheComposer() async throws {
+        let model = await fixtureModel()
+        model.messages = [ChatMessage(role: .user, text: "写一份分段说明")]
+        model.connection = .running
+        model.runPhase = .thinking
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let host = try await host(NavigationStack { ConversationScreen(onSettings: {}) }
+            .environmentObject(model).environmentObject(ConversationScrollStore())
+            .environment(\.scenePhase, .active), size: scene.effectiveGeometry.coordinateSpace.bounds.size, style: .light)
+        let scroll = try XCTUnwrap(verticalScroll(in: host.view))
+        model.messages.append(ChatMessage(role: .tool, text: "", toolTitle: "read", toolStatus: .finished))
+        model.messages.append(ChatMessage(role: .assistant, text: "说明", streaming: true))
+        model.runPhase = .replying
+        for batch in 1...5 {
+            let previousHeight = scroll.contentSize.height
+            let paragraph = String(repeating: "这是回复中的一行。\n", count: 18)
+            model.messages[2].text += "\n\n## 第 \(batch) 段\n\n" + paragraph
+            try await eventually { scroll.contentSize.height > previousHeight + 150 }
+            await settle()
+            let gap = max(0, scroll.contentSize.height + scroll.adjustedContentInset.bottom - scroll.bounds.height - scroll.contentOffset.y)
+            XCTAssertLessThan(gap, 5, "Batch \(batch) left the latest line \(gap) points below the chat viewport")
+        }
     }
 
     func testChatShowsLiveToolStepsWithoutEmptyBubblesOrExtraWaitingIndicator() {

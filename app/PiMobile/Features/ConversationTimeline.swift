@@ -22,6 +22,7 @@ struct ConversationTimeline<Content: View>: View {
     let storageKey: String
     let messageIDs: [UUID]
     let isLoading: Bool
+    var submittedPromptID: String? = nil
     @ViewBuilder var content: () -> Content
 
     @EnvironmentObject private var store: ConversationScrollStore
@@ -103,6 +104,10 @@ struct ConversationTimeline<Content: View>: View {
                 store.save(viewport, for: storageKey)
             }
         }
+        .onChange(of: submittedPromptID) { _, id in
+            guard id != nil else { return }
+            followLatest(animated: false)
+        }
         .onChange(of: isLoading) { _, loading in
             guard !loading, ready else { return }
             needsRestore = true
@@ -111,11 +116,7 @@ struct ConversationTimeline<Content: View>: View {
         .overlay(alignment: .bottomTrailing) {
             if ready, !viewport.followsLatest, !messageIDs.isEmpty {
                 Button {
-                    viewport.followsLatest = true
-                    store.save(viewport, for: storageKey)
-                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
-                        position.scrollTo(edge: .bottom)
-                    }
+                    followLatest(animated: true)
                 } label: {
                     Label("回到最新", systemImage: "arrow.down")
                         .font(.caption.weight(.semibold))
@@ -127,6 +128,14 @@ struct ConversationTimeline<Content: View>: View {
                 .buttonStyle(bouncy())
                 .padding(16)
             }
+        }
+    }
+
+    private func followLatest(animated: Bool) {
+        viewport.followsLatest = true
+        store.save(viewport, for: storageKey)
+        withAnimation(animated && !reduceMotion ? .easeOut(duration: 0.2) : nil) {
+            position.scrollTo(edge: .bottom)
         }
     }
 

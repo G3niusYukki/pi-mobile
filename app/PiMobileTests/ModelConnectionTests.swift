@@ -418,9 +418,9 @@ final class ModelConnectionTests: XCTestCase {
 }
 
 @MainActor
-private final class SessionFixture {
+final class SessionFixture {
     private let gateway: FixtureGateway
-    var socket: CommandSocket { gateway.currentSocket! }
+    fileprivate var socket: CommandSocket { gateway.currentSocket! }
     let client: RelayClient
     let app: AppModel
     let token = String(repeating: "a", count: 64)
@@ -434,7 +434,7 @@ private final class SessionFixture {
         app = AppModel(client: client, rpcTimeout: rpcTimeout)
     }
 
-    static func ready(rpcTimeout: Duration = .seconds(15), path: String? = nil) async throws -> SessionFixture {
+    static func ready(rpcTimeout: Duration = .seconds(15), path: String? = nil, history: [[String: Any]]? = nil) async throws -> SessionFixture {
         let f = SessionFixture(rpcTimeout: rpcTimeout)
         await f.drain()
         let pub = f.gateway.privateKey.publicKey.rawRepresentation.base64UrlEncoded
@@ -447,7 +447,7 @@ private final class SessionFixture {
         }
         await f.state(initial, model: "a", path: path)
         if let path {
-            await f.history(try await f.next("session_history"), path: path, items: [f.savedQuestion])
+            await f.history(try await f.next("session_history"), path: path, items: history ?? [f.savedQuestion])
         }
         await f.reply(try await f.next("get_available_models"), data: ["models": []])
         await f.reply(try await f.next("session_catalog"), data: ["sessions": []])

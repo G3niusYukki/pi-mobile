@@ -20,6 +20,8 @@ final class AppModel: ObservableObject {
     @Published var showConversation = false
     @Published var focusComposer = false
     @Published var draft = ""
+    /// Advances on local sends, including photos and follow-ups during a run.
+    @Published private(set) var submittedPromptID: String?
     @Published var sessions: [[String: Any]] = []
     @Published var selectedSessionPath: String?
     @Published var selectedSessionTitle: String?
@@ -270,6 +272,7 @@ final class AppModel: ObservableObject {
             return false
         }
         draft = ""
+        submittedPromptID = id
         publishConversation()
         sendRPC(command, kind: .prompt, failure: "发送结果未确认，不会自动重发")
         return true
