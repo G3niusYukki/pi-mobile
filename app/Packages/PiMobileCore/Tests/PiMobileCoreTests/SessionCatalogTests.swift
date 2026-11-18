@@ -38,6 +38,19 @@ final class SessionCatalogTests: XCTestCase {
         XCTAssertNotEqual(first.title, second.title)
     }
 
+    func testRecognizesClippedPiPhotoTitlesAndSplitSummaryFromOlderGateways() throws {
+        let topic = "[Image: original 2853x2007, displayed at 2000x1…"
+        let summary = "Multiply coordinates by 1.43 to map to original image.]"
+        let photo = try XCTUnwrap(PiSessionEntry(["path": "/photo", "title": topic, "summary": summary]))
+        XCTAssertEqual(photo.title, "图片讨论")
+        XCTAssertNil(photo.summary)
+        let caption = try XCTUnwrap(PiSessionEntry(["path": "/caption", "title": topic, "summary": "检查插图颜色。" ]))
+        XCTAssertEqual(caption.title, "检查插图颜色。")
+        XCTAssertNil(caption.summary)
+        let realTitle = "[Image: original schema diagrams]"
+        XCTAssertEqual(PiSessionEntry(["path": "/diagram", "title": realTitle])?.title, realTitle)
+    }
+
     func testSummaryIsOptionalAndDoesNotRepeatTheTopic() throws {
         for summary in [NSNull(), "  \n ", "  编译缓存  "] as [Any] {
             let entry = try XCTUnwrap(PiSessionEntry(["path": "/a", "title": "编译缓存", "summary": summary]))

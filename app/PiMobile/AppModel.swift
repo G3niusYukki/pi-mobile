@@ -7,13 +7,16 @@ final class AppModel: ObservableObject {
     @Published var connection: ConnectionState = .idle
     @Published var messages: [ChatMessage] = []
     @Published var approvals: [ApprovalRequest] = []
+    @Published var runPhase: RunPhase = .waiting
     @Published var models: [ModelOption] = []
     @Published var selectedModel = ""
     @Published var thinking = "high"
     @Published private var connectionError: String?
     @Published private var actionError: String?
+    @Published private var stateReadError: StateReadError?
+    @Published private var historyReadError: String?
     @Published private(set) var settingError: String?
-    var errorMessage: String? { connectionError ?? settingError ?? actionError }
+    var errorMessage: String? { connectionError ?? settingError ?? actionError ?? historyReadError ?? stateReadError?.message }
     @Published var showConversation = false
     @Published var focusComposer = false
     @Published var draft = ""
@@ -32,6 +35,7 @@ final class AppModel: ObservableObject {
     var canChangeSettings: Bool { isConnected && conversation.canSend && !recoveringSetting && queuedSession == nil }
 
     private let client: RelayClient
+    private let rpcTimeout: Duration
     private var confirmedModel = ""
     private var confirmedThinking = "high"
     private var settingInFlight: (id: String, change: SettingChange)?
@@ -63,14 +67,26 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private enum StateReadError {
+        case timedOut, failed(String)
+
+        var message: String {
+            switch self {
+            case .timedOut: return "获取状态失败：等待响应超时"
+            case .failed(let message): return message
+            }
+        }
+    }
+
     private enum RequestKind {
         case state(refreshHistory: Bool), history, models, catalog, prompt, sessionChange(SessionDestination), setting, command
     }
 
     convenience init() { self.init(client: RelayClient()) }
 
-    init(client: RelayClient) {
+    init(client: RelayClient, rpcTimeout: Duration = .seconds(15)) {
         self.client = client
+        self.rpcTimeout = rpcTimeout
         isPaired = client.hasPairing
         conversationID = conversation.conversationID
         client.onEvent = { [weak self] event in self?.apply(event) }
@@ -152,6 +168,8 @@ final class AppModel: ObservableObject {
         connectionError = nil
         settingError = nil
         actionError = nil
+        stateReadError = nil
+        historyReadError = nil
     }
 
     // MARK: - 会话
@@ -352,10 +370,23 @@ final class AppModel: ObservableObject {
         guard let id = command["id"] as? String else { return }
         requests[id] = kind
         let generation = transportGeneration
-        deadlines[id] = Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: 15_000_000_000) }
+        deadlines[id] = Task { [weak self, rpcTimeout] in
+            do { try await Task.sleep(for: rpcTimeout) }
             catch { return }
-            self?.requestFailed(id: id, message: "\(failure)：等待响应超时", outcomeUnknown: true)
+            guard !Task.isCancelled, let self else { return }
+            deadlines.removeValue(forKey: id)
+            let message = "\(failure)：等待响应超时"
+            switch requests[id] {
+            case .state:
+                // A snapshot can wait behind a native mutation. Keep the ID for readback.
+                if conversation.pendingStateID == id, connection != .running { stateReadError = .timedOut }
+            case .history:
+                // Both reads can still succeed. A visible transcript can refresh silently.
+                if conversation.historyTimedOut(id: id) { historyReadError = message }
+                publishConversation()
+            default:
+                requestFailed(id: id, message: message, outcomeUnknown: true)
+            }
         }
         Task {
             guard generation == transportGeneration, requests[id] != nil else { return }
@@ -379,6 +410,8 @@ final class AppModel: ObservableObject {
     }
 
     private func discardReadRequests() {
+        stateReadError = nil
+        historyReadError = nil
         let ids = requests.compactMap { id, kind -> String? in
             switch kind {
             case .state, .history: return id
@@ -426,9 +459,17 @@ final class AppModel: ObservableObject {
         case .models, .catalog, .command, .setting:
             break
         }
-        actionError = message
+        recordRequestError(message, for: kind)
         publishConversation()
         if reconcile, client.isConnected { requestState(refreshHistory: true) }
+    }
+
+    private func recordRequestError(_ message: String, for kind: RequestKind) {
+        switch kind {
+        case .state: stateReadError = .failed(message)
+        case .history: historyReadError = message
+        default: actionError = message
+        }
     }
 
     private func requestState(refreshHistory: Bool = false) {
@@ -458,7 +499,9 @@ final class AppModel: ObservableObject {
 
     private func requestHistory(path: String) {
         guard client.isConnected, conversation.pendingChange == nil else { return }
-        if let previous = conversation.pendingHistoryID { finishRequest(previous) }
+        for (id, kind) in requests {
+            if case .history = kind { finishRequest(id) }
+        }
         let id = nextID("history")
         conversation.beginHistory(id: id, path: path)
         publishConversation()
@@ -481,6 +524,12 @@ final class AppModel: ObservableObject {
         guard let id = response["id"] as? String, let kind = requests[id] else { return }
         let success = response["success"] as? Bool == true
         let data = response["data"] as? [String: Any]
+        if success {
+            switch kind {
+            case .models, .prompt, .command, .setting, .sessionChange: clearStateTimeout()
+            case .catalog, .history, .state: break // Gateway-local reads or a state snapshot validated below.
+            }
+        }
         if case .setting = kind {
             finishSetting(id: id, error: success ? nil : response["error"] as? String ?? "设置失败")
             return
@@ -508,7 +557,7 @@ final class AppModel: ObservableObject {
                 guard conversation.failRequest(id: id) else { return }
             default: break
             }
-            actionError = response["error"] as? String ?? "请求失败"
+            recordRequestError(response["error"] as? String ?? "请求失败", for: kind)
             publishConversation()
             return
         }
@@ -555,12 +604,18 @@ final class AppModel: ObservableObject {
                 return
             }
             finishRequest(id)
+            stateReadError = nil
             let path = data["sessionFile"] as? String
             let running = streaming || data["isCompacting"] as? Bool == true || (data["pendingMessageCount"] as? Int ?? 0) > 0
             let recoveringChangeID = conversation.pendingChange?.id
+            let previousHistoryID = conversation.pendingHistoryID
             let appliesToTranscript = conversation.receiveState(id: id, path: path, running: running,
                 messageCount: data["messageCount"] as? Int, sessionBarrier: data["sessionBarrier"] as? Bool == true,
                 sessionBarrierID: data["sessionBarrierId"] as? String)
+            if let previousHistoryID, conversation.pendingHistoryID != previousHistoryID {
+                finishRequest(previousHistoryID)
+                historyReadError = nil
+            }
             guard conversation.pendingChange == nil else { return }
             if let recoveringChangeID {
                 finishRequest(recoveringChangeID)
@@ -582,6 +637,7 @@ final class AppModel: ObservableObject {
             let wasReady = conversation.isSessionReady
             guard conversation.receiveHistory(id: id, path: data?["sessionPath"] as? String, items: items, hasEarlierMessages: data?["hasEarlierMessages"] as? Bool == true) else { return }
             finishRequest(id)
+            historyReadError = nil
             if !wasReady { requestState() }
         case .command, .setting:
             finishRequest(id)
@@ -615,7 +671,14 @@ final class AppModel: ObservableObject {
         publishSettings()
     }
 
+    private func clearStateTimeout() {
+        if case .timedOut? = stateReadError { stateReadError = nil }
+    }
+
     private func apply(_ event: [String: Any]) {
+        // RelayClient only delivers decrypted Pi events. Keep the snapshot ID for readback.
+        clearStateTimeout()
+        if let id = conversation.pendingStateID { deadlines.removeValue(forKey: id)?.cancel() }
         if let approval = conversation.applyEvent(event), !approvals.contains(where: { $0.id == approval.id }) {
             approvals.append(approval)
         }
@@ -629,6 +692,7 @@ final class AppModel: ObservableObject {
     }
 
     private func publishConversation() {
+        if runPhase != conversation.runPhase { runPhase = conversation.runPhase }
         if conversationID != conversation.conversationID { conversationID = conversation.conversationID }
         if messages != conversation.messages { messages = conversation.messages }
         if selectedSessionPath != conversation.sessionPath {
@@ -661,6 +725,8 @@ final class AppModel: ObservableObject {
         transportConnected = connected
         connectionError = state == .error ? (error ?? "连接出错") : nil
         if !connected {
+            stateReadError = nil
+            historyReadError = nil
             conversation.disconnected()
             queuedSession = nil
             markSettingUncertain()

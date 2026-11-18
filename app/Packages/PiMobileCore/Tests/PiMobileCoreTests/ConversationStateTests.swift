@@ -570,6 +570,64 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(state.messages.map(\.text), ["B"])
     }
 
+    func testToolExecutionBeforeAnyTextPlacesProgressBeforeTheReply() {
+        var state = loadedState()
+        _ = state.preparePrompt(id: "p", text: "检查文件", connected: true)
+        state.applyEvent(["type": "tool_execution_start", "toolCallId": "1", "toolName": "read"])
+        state.applyEvent(["type": "tool_execution_end", "toolCallId": "1", "toolName": "read"])
+        state.applyEvent(textDelta("找到文件了"))
+        XCTAssertEqual(state.messages.suffix(3).map(\.role), [.user, .tool, .assistant])
+    }
+
+    func testLateToolUpdateDoesNotRollBackTerminalOutput() {
+        var state = ConversationState()
+        state.applyEvent(["type": "tool_execution_end", "toolCallId": "1", "toolName": "read", "isError": true, "result": ["content": "文件不存在"]])
+        state.applyEvent(["type": "tool_execution_update", "toolCallId": "1", "partialResult": ["content": "查找中"]])
+        XCTAssertEqual(state.messages.map(\.text), ["文件不存在"])
+    }
+
+    func testPhasesAndConcurrentToolsShowOnlyConfirmedActivity() {
+        var state = loadedState()
+        state.applyEvent(["type": "run_phase", "phase": "thinking", "sessionPath": "/other"])
+        XCTAssertEqual(state.runPhase, .waiting)
+        state.applyEvent(["type": "run_phase", "phase": "thinking", "delta": "private"])
+        XCTAssertEqual(state.runPhase, .thinking)
+        XCTAssertFalse(state.messages.contains { $0.text.contains("private") })
+        state.applyEvent(["type": "run_phase", "phase": "preparing_tool"])
+        XCTAssertEqual(state.runPhase, .preparingTool)
+        for id in ["a", "b"] { state.applyEvent(["type": "tool_execution_start", "toolCallId": id, "toolName": "read"]) }
+        state.applyEvent(["type": "tool_execution_update", "toolCallId": "a", "partialResult": ["content": "读取中"]])
+        state.applyEvent(["type": "tool_execution_end", "toolCallId": "b", "isError": true, "durationMs": 123])
+        XCTAssertEqual(state.messages.suffix(2).map(\.toolStatus), [.running, .failed])
+        XCTAssertEqual(state.messages.suffix(2).first?.toolUpdates, 1)
+        XCTAssertEqual(state.messages.last?.toolDurationMs, 123)
+        state.disconnected()
+        XCTAssertEqual(state.messages.suffix(2).map(\.toolStatus), [.unconfirmed, .failed])
+        state.applyEvent(["type": "tool_execution_end", "toolCallId": "a"])
+        XCTAssertEqual(state.messages.suffix(2).map(\.toolStatus), [.finished, .failed])
+        state.applyEvent(textDelta("正文"))
+        XCTAssertEqual(state.runPhase, .replying)
+        state.applyEvent(["type": "agent_settled"])
+        XCTAssertFalse(state.isRunning)
+        XCTAssertEqual(state.runPhase, .waiting)
+    }
+
+    func testHistoryKeepsTheOptimisticPhotoAndRemovesOnlyTheImageHint() throws {
+        let bytes = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGM4UCDxHwAFhAJIWblWNgAAAABJRU5ErkJggg=="))
+        var state = loadedState()
+        _ = state.preparePrompt(id: "p", text: "", image: bytes, connected: true)
+        let local = try XCTUnwrap(state.messages.last { $0.role == .user })
+        XCTAssertEqual(local.attachments.first?.data, bytes)
+        state.beginHistory(id: "photos", path: "/a")
+        let hint = "[Image: original 2853x2007, displayed at 2000x1407. Multiply coordinates by 1.43 to map to original image.]"
+        _ = state.receiveHistory(id: "photos", path: "/a", items: [item("a", "user", "A"), item("photo", "user", hint)])
+        XCTAssertEqual(state.messages.filter { $0.role == .user }.count, 2)
+        let merged = try XCTUnwrap(state.messages.first { $0.sourceID == "photo" })
+        XCTAssertEqual(merged.id, local.id)
+        XCTAssertEqual(merged.text, "")
+        XCTAssertEqual(merged.attachments.first?.data, bytes)
+    }
+
     private func loadedState() -> ConversationState {
         var state = ConversationState()
         state.beginHistory(id: "initial", path: "/a")

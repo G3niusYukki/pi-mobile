@@ -45,8 +45,10 @@ final class WhalenessInterfaceTests: XCTestCase {
         let nav = try XCTUnwrap(findNavigation(in: host))
         XCTAssertEqual(nav.viewControllers.count, 1)
         model.showConversation = true
-        try await eventually { nav.viewControllers.count == 2 }
-        nav.popViewController(animated: false)
+        // UIKit installs the second controller before the push animation finishes.
+        // Wait until Back is available, just as it would be for a person tapping it.
+        try await eventually { nav.viewControllers.count == 2 && nav.topViewController?.viewIfLoaded?.window != nil && nav.transitionCoordinator == nil }
+        XCTAssertNotNil(nav.popViewController(animated: false))
         try await eventually { !model.showConversation && nav.viewControllers.count == 1 }
         model.showConversation = true
         try await eventually { nav.viewControllers.count == 2 }
@@ -85,18 +87,22 @@ final class WhalenessInterfaceTests: XCTestCase {
         try await eventually { abs(measurement.height - initial) < 2 }
     }
 
-    func testTranscriptSeparatesRepliesFromTraceDuringAToolCall() {
+    func testChatShowsLiveToolStepsWithoutEmptyBubblesOrExtraWaitingIndicator() {
         let user = ChatMessage(role: .user, text: "整理路线")
         let pending = ChatMessage(role: .assistant, text: "", streaming: true)
-        let tool = ChatMessage(role: .tool, text: "2 条记录")
+        let tool = ChatMessage(role: .tool, text: "2 条记录", toolTitle: "read", toolStatus: .running)
         let reply = ChatMessage(role: .assistant, text: "建议先去公园。", streaming: true)
         let history = [user, pending, tool]
-        XCTAssertEqual(ConversationTab.chat.messages(in: history), [user])
-        XCTAssertEqual(ConversationTab.trace.messages(in: history), [tool])
-        XCTAssertTrue(ConversationTab.waitsForReply(in: history, connection: .running))
-        XCTAssertFalse(ConversationTab.waitsForReply(in: history, connection: .paired))
-        XCTAssertEqual(ConversationTab.chat.messages(in: history + [reply]), [user, reply])
-        XCTAssertFalse(ConversationTab.waitsForReply(in: history + [reply], connection: .running))
+        let second = ChatMessage(role: .tool, text: "", toolTitle: "grep", toolStatus: .finished)
+        XCTAssertEqual(ConversationTab.chat.rows(in: history + [second, reply]).map(\.id), [user.id, tool.id, reply.id])
+        XCTAssertEqual(ConversationTab.trace.rows(in: history + [second, reply]).map(\.id), [tool.id, second.id])
+        XCTAssertNil(ConversationTab.activityLabel(in: history, connection: .running, phase: .waiting))
+        XCTAssertNil(ConversationTab.activityLabel(in: [user], connection: .paired, phase: .thinking))
+        XCTAssertEqual(ConversationTab.activityLabel(in: [user, pending], connection: .running, phase: .thinking), "正在思考…")
+        XCTAssertNil(ConversationTab.activityLabel(in: [user, reply], connection: .running, phase: .replying))
+        let block = ToolStepGroup(steps: [second, tool])
+        XCTAssertEqual(block.headline, "正在读取文件")
+        XCTAssertEqual(block.detail, "1/2 已完成")
     }
 
     func testWorkspaceAdaptsToDuoAndAccessibilitySizes() {
@@ -119,7 +125,7 @@ final class WhalenessInterfaceTests: XCTestCase {
             SessionsPane(onSettings: {})
         }
         model.clearError()
-        XCTAssertEqual(ConversationTab.chat.messages(in: model.messages).count, 2, "Rendered conversation must contain the supplied history")
+        XCTAssertEqual(ConversationTab.chat.rows(in: model.messages).count, 3, "The main timeline contains the inline activity between question and answer")
         try await snapshot("conversation-light", size: narrow, style: .light, model: model, store: store) {
             ConversationScreen(onSettings: {})
         }
@@ -128,7 +134,17 @@ final class WhalenessInterfaceTests: XCTestCase {
         }
         model.messages.append(ChatMessage(role: .user, text: "如果下雨，有室内的备选吗？"))
         model.connection = .running
+        model.runPhase = .thinking
         try await snapshot("conversation-waiting", size: narrow, style: .dark, model: model, store: store) {
+            ConversationScreen(onSettings: {})
+        }
+        let finished = ChatMessage(role: .tool, text: "找到路线笔记。", toolTitle: "find", toolStatus: .finished)
+        var active = ChatMessage(role: .tool, text: "已读取河堤附近的场馆。", toolTitle: "read", toolStatus: .running)
+        active.toolUpdates = 1
+        model.messages.append(contentsOf: [finished, active])
+        // The native Duo toolbar anchors to the scene, so capture the live run at the device's actual size.
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        try await snapshot("conversation-live-tools", size: scene.effectiveGeometry.coordinateSpace.bounds.size, style: .light, model: model, store: store) {
             ConversationScreen(onSettings: {})
         }
         model.connection = .paired

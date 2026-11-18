@@ -6,6 +6,226 @@ import XCTest
 /// Exercise the production handshake, encrypted wire commands, and app callbacks in memory.
 @MainActor
 final class ModelConnectionTests: XCTestCase {
+    func testStreamingDuringAStateRefreshKeepsChatClearAndAcceptsTheLateReply() async throws {
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
+        f.app.draft = "a slow answer"
+        XCTAssertTrue(f.app.send())
+        await f.reply(try await f.next("prompt"), data: ["disposition": "started"])
+        await f.event(["type": "agent_start"])
+        f.app.resume()
+        let snapshot = try await f.next("get_state")
+        await f.delta("still speaking")
+        try await Task.sleep(for: .milliseconds(600))
+
+        XCTAssertEqual(f.app.messages.last?.text, "still speaking")
+        XCTAssertEqual(f.app.connection, .running)
+        XCTAssertNil(f.app.errorMessage, "A delayed background snapshot must not interrupt a live reply")
+        await f.state(snapshot, model: "b")
+        XCTAssertEqual(f.app.selectedModel, "fixture/b", "The correlated late reply still owns the settings readback")
+        XCTAssertEqual(f.app.connection, .running, "The older idle snapshot must not settle a newer delta")
+    }
+
+    func testSilentStateTimeoutClearsOnlyWhenPiTrafficResumes() async throws {
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
+        f.app.resume()
+        let snapshot = try await f.next("get_state")
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(f.app.errorMessage, "获取状态失败：等待响应超时")
+        await f.client.handle(["type": "event", "sealed": "invalid fixture"])
+        XCTAssertEqual(f.app.errorMessage, "获取状态失败：等待响应超时")
+
+        await f.delta("new progress")
+        XCTAssertNil(f.app.errorMessage)
+        XCTAssertEqual(f.app.messages.last?.text, "new progress")
+        await f.state(snapshot, model: "b")
+        XCTAssertEqual(f.app.selectedModel, "fixture/b")
+    }
+
+    func testStateTimeoutDoesNotReplaceRejectedStopOrHideGatewayLoss() async throws {
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
+        f.app.stop()
+        await f.reply(try await f.next("abort"), error: "Fixture stop rejected")
+        f.app.resume()
+        let snapshot = try await f.next("get_state")
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(f.app.errorMessage, "Fixture stop rejected")
+        await f.state(snapshot, model: "b")
+        XCTAssertEqual(f.app.errorMessage, "Fixture stop rejected")
+        await f.client.handle(["type": "status", "state": "unknown"])
+        XCTAssertEqual(f.app.errorMessage, "Mac gateway 离线")
+        await f.client.handle(["type": "status", "state": "idle"])
+        XCTAssertEqual(f.app.errorMessage, "Fixture stop rejected")
+    }
+
+    func testLateStateBarrierRecoversAnUnacknowledgedSessionSwitch() async throws {
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
+        let path = "/fixture/recovered.jsonl"
+        f.app.switchSession(path)
+        let change = try await f.next("switch_session")
+        let changeID = try XCTUnwrap(change["id"] as? String)
+        await f.client.handle(["type": "status", "state": "unknown"])
+        await f.client.handle(["type": "status", "state": "idle"])
+        let snapshot = try await f.next("get_state")
+        XCTAssertEqual(snapshot["afterSessionChangeId"] as? String, changeID)
+        await f.reply(try await f.next("get_available_models"), data: ["models": []])
+        await f.reply(try await f.next("session_catalog"), data: ["sessions": []])
+        try await Task.sleep(for: .milliseconds(600))
+        await f.delta("activity while the switch is pending")
+        XCTAssertFalse(f.app.canSend, "Progress alone cannot acknowledge the session switch")
+
+        await f.reply(snapshot, data: ["isStreaming": false, "messageCount": 0, "sessionFile": path,
+                                       "sessionBarrier": true, "sessionBarrierId": changeID])
+        XCTAssertTrue(f.app.canSend)
+        XCTAssertEqual(f.app.selectedSessionPath, path)
+        XCTAssertNil(f.app.errorMessage)
+    }
+
+    func testSilentNewSocketShowsStateTimeoutAndKeepsThePreviousReplyAndTool() async throws {
+        let path = "/fixture/reconnect.jsonl"
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500), path: path)
+        await f.delta("Partial reply")
+        await f.event(["type": "tool_execution_update", "toolCallId": "call-1", "toolName": "read",
+                       "partialResult": ["content": "Partial tool output"]])
+        let assistant = try XCTUnwrap(f.app.messages.first { $0.role == .assistant })
+        let tool = try XCTUnwrap(f.app.messages.first { $0.role == .tool })
+        XCTAssertEqual(f.app.connection, .running)
+        let oldSocket = f.socket
+        f.app.reconnect()
+        XCTAssertFalse(f.socket === oldSocket)
+        await f.handshake()
+        let state = try await f.next("get_state")
+        let history = try await f.next("session_history")
+        await f.reply(try await f.next("get_available_models"), data: ["models": []])
+        await f.reply(try await f.next("session_catalog"), data: ["sessions": []])
+        // The saved file can lag the live stream. No new Pi event follows this handshake.
+        await f.history(history, path: path, items: [f.savedQuestion])
+        XCTAssertEqual(f.app.connection, .paired)
+        XCTAssertEqual(f.app.messages.first { $0.id == assistant.id }?.text, "Partial reply")
+        XCTAssertEqual(f.app.messages.first { $0.id == tool.id }?.toolStatus, .unconfirmed)
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(f.app.errorMessage, "获取状态失败：等待响应超时")
+        await f.state(state, model: "b", path: path)
+        XCTAssertEqual(f.app.selectedModel, "fixture/b")
+        XCTAssertNil(f.app.errorMessage)
+        await f.history(try await f.next("session_history"), path: path, items: [f.savedQuestion,
+            ["id": "answer", "role": "assistant", "text": "Partial reply completed"],
+            ["id": "tool", "role": "tool", "toolTitle": "read", "toolCallId": "call-1", "text": "Complete output"]])
+        XCTAssertEqual(f.app.messages.first { $0.id == assistant.id }?.text, "Partial reply completed")
+        XCTAssertEqual(f.app.messages.first { $0.id == tool.id }?.text, "Complete output")
+    }
+
+    func testIdleStateBeforeLaggingHistoryPreservesTheInterruptedTurnOnTheSameBranch() async throws {
+        let path = "/fixture/idle-before-history.jsonl"
+        let f = try await SessionFixture.ready(path: path)
+        f.app.draft = "Local question"
+        XCTAssertTrue(f.app.send())
+        await f.reply(try await f.next("prompt"), data: ["disposition": "started"])
+        await f.delta("Reply so far")
+        await f.event(["type": "tool_execution_start", "toolCallId": "call", "toolName": "read"])
+        let ids = f.app.messages.map(\.id)
+        f.app.reconnect()
+        await f.handshake()
+        let state = try await f.next("get_state")
+        let history = try await f.next("session_history")
+        await f.state(state, model: "a", path: path)
+        await f.history(history, path: path, items: [f.savedQuestion])
+        XCTAssertEqual(f.app.connection, .paired)
+        XCTAssertEqual(f.app.messages.map(\.id), ids)
+        XCTAssertEqual(f.app.messages.last?.toolStatus, .unconfirmed)
+        f.app.resume()
+        await f.history(try await f.next("session_history"), path: path, items: [
+            ["id": "other", "role": "user", "text": "Another branch"]])
+        XCTAssertEqual(f.app.messages.map(\.text), ["Another branch"])
+    }
+
+    func testCurrentSocketCanConfirmASlowRunWithoutAdditionalDeltas() async throws {
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
+        await f.event(["type": "run_phase", "phase": "thinking"])
+        f.app.resume()
+        let snapshot = try await f.next("get_state")
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(f.app.connection, .running)
+        XCTAssertNil(f.app.errorMessage)
+        await f.state(snapshot, model: "b")
+        XCTAssertEqual(f.app.connection, .paired)
+        XCTAssertEqual(f.app.selectedModel, "fixture/b")
+    }
+
+    func testKnownHistoryRefreshKeepsItsLateReplyWhilePiStreams() async throws {
+        let path = "/fixture/background.jsonl"
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500), path: path)
+        f.app.resume()
+        let state = try await f.next("get_state")
+        let history = try await f.next("session_history")
+        await f.state(state, model: "a", path: path)
+        await f.delta("Still working")
+        let assistant = try XCTUnwrap(f.app.messages.last)
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertNil(f.app.errorMessage)
+        XCTAssertFalse(f.app.isLoadingHistory, "A refresh of an already visible transcript must leave session actions available")
+        await f.history(history, path: path, items: [f.savedQuestion,
+            ["id": "new", "role": "user", "text": "Arrived in history"]])
+        XCTAssertTrue(f.app.messages.contains { $0.sourceID == "new" })
+        XCTAssertEqual(f.app.messages.last?.id, assistant.id)
+        XCTAssertEqual(f.app.messages.last?.text, "Still working")
+        XCTAssertNil(f.app.errorMessage)
+    }
+
+    func testExplicitSwitchKeepsHistoryTimeoutAndRealReadFailureVisible() async throws {
+        let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500), path: "/fixture/previous.jsonl")
+        let path = "/fixture/destination.jsonl"
+        f.app.switchSession(path)
+        await f.reply(try await f.next("switch_session"))
+        let history = try await f.next("session_history")
+        await f.reply(try await f.next("session_catalog"), data: ["sessions": []])
+        XCTAssertTrue(f.app.isLoadingHistory)
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(f.app.errorMessage, "加载历史失败：等待响应超时")
+        XCTAssertFalse(f.app.isLoadingHistory)
+        XCTAssertFalse(f.app.canSend)
+        await f.reply(history, error: "Fixture history is unreadable")
+        XCTAssertEqual(f.app.errorMessage, "Fixture history is unreadable")
+        XCTAssertEqual(f.app.selectedSessionPath, "/fixture/previous.jsonl")
+    }
+
+    func testNativePromptAckClearsOnlyStateTimeoutAndKeepsSettingsReadback() async throws {
+        for disposition in ["queued", "handled"] {
+            let f = try await SessionFixture.ready(rpcTimeout: .milliseconds(500))
+            f.app.resume()
+            let snapshot = try await f.next("get_state")
+            try await Task.sleep(for: .milliseconds(600))
+            XCTAssertEqual(f.app.errorMessage, "获取状态失败：等待响应超时")
+            f.app.loadSessions()
+            await f.reply(try await f.next("session_catalog"), data: ["sessions": []])
+            XCTAssertEqual(f.app.errorMessage, "获取状态失败：等待响应超时")
+            f.app.draft = "fixture prompt"
+            XCTAssertTrue(f.app.send())
+            let prompt = try await f.next("prompt")
+            XCTAssertEqual(f.app.errorMessage, "获取状态失败：等待响应超时")
+            await f.reply(prompt, data: ["disposition": disposition])
+            XCTAssertNil(f.app.errorMessage, disposition)
+            await f.state(snapshot, model: "b")
+            XCTAssertEqual(f.app.selectedModel, "fixture/b")
+        }
+    }
+
+    func testNativeAckKeepsAnExplicitStateFailure() async throws {
+        let f = try await SessionFixture.ready()
+        f.app.resume()
+        await f.reply(try await f.next("get_state"), error: "Fixture state rejected")
+        f.app.draft = "fixture prompt"
+        XCTAssertTrue(f.app.send())
+        await f.reply(try await f.next("prompt"), data: ["disposition": "handled"])
+        XCTAssertEqual(f.app.errorMessage, "Fixture state rejected")
+    }
+
+    func testProductionSocketCanReceiveAnEncryptedHistoryFrameUpToTheRelayLimit() throws {
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "wss://test.invalid/pi/client")))
+        let socket = RelayClient.webSocket(for: request)
+        defer { socket.cancel() }
+        XCTAssertEqual(socket.maximumMessageSize, 12 * 1024 * 1024)
+    }
+
     func testOldStateCannotMoveCheckmarkWhileModelChangeIsInFlight() async throws {
         let f = try await SessionFixture.ready()
         f.app.resume()
@@ -199,23 +419,25 @@ final class ModelConnectionTests: XCTestCase {
 
 @MainActor
 private final class SessionFixture {
-    let socket = CommandSocket()
+    private let gateway: FixtureGateway
+    var socket: CommandSocket { gateway.currentSocket! }
     let client: RelayClient
     let app: AppModel
     let token = String(repeating: "a", count: 64)
 
-    init() {
-        let socket = socket
+    init(rpcTimeout: Duration) {
+        let gateway = FixtureGateway()
+        self.gateway = gateway
         var record: String?
         let store = PairingStore(read: { record }, write: { record = $0; return true }, clear: { record = nil })
-        client = RelayClient(endpoint: nil, store: store, makeSocket: { _ in socket })
-        app = AppModel(client: client)
+        client = RelayClient(endpoint: nil, store: store, makeSocket: { _ in gateway.openSocket() })
+        app = AppModel(client: client, rpcTimeout: rpcTimeout)
     }
 
-    static func ready() async throws -> SessionFixture {
-        let f = SessionFixture()
+    static func ready(rpcTimeout: Duration = .seconds(15), path: String? = nil) async throws -> SessionFixture {
+        let f = SessionFixture(rpcTimeout: rpcTimeout)
         await f.drain()
-        let pub = f.socket.gateway.publicKey.rawRepresentation.base64UrlEncoded
+        let pub = f.gateway.privateKey.publicKey.rawRepresentation.base64UrlEncoded
         f.app.pair(token: "https://test.invalid/pi/pair#" + String(repeating: "b", count: 32) + "." + pub)
         await f.handshake()
         await f.drain()
@@ -223,7 +445,12 @@ private final class SessionFixture {
         while let i = f.socket.commands.firstIndex(where: { $0["type"] as? String == "get_state" }) {
             initial = f.socket.commands.remove(at: i)
         }
-        await f.state(initial, model: "a")
+        await f.state(initial, model: "a", path: path)
+        if let path {
+            await f.history(try await f.next("session_history"), path: path, items: [f.savedQuestion])
+        }
+        await f.reply(try await f.next("get_available_models"), data: ["models": []])
+        await f.reply(try await f.next("session_catalog"), data: ["sessions": []])
         XCTAssertEqual(f.app.selectedModel, "fixture/a")
         return f
     }
@@ -251,16 +478,46 @@ private final class SessionFixture {
         await client.handle(["type": "rpc_response", "sealed": socket.key!.seal(response)!])
     }
 
-    func state(_ command: [String: Any], model: String, thinking: String = "high") async {
-        await reply(command, data: ["isStreaming": false, "messageCount": 0, "model": ["provider": "fixture", "id": model], "thinkingLevel": thinking])
+    func event(_ body: [String: Any]) async {
+        await client.handle(["type": "event", "sealed": socket.key!.seal(body)!])
+    }
+
+    func delta(_ text: String) async {
+        await event(["type": "message_update", "assistantMessageEvent": ["type": "text_delta", "delta": text]])
+    }
+
+    var savedQuestion: [String: Any] { ["id": "saved-question", "role": "user", "text": "Saved question"] }
+
+    func history(_ command: [String: Any], path: String, items: [[String: Any]]) async {
+        await reply(command, data: ["sessionPath": path, "messages": items])
+    }
+
+    func state(_ command: [String: Any], model: String, thinking: String = "high", path: String? = nil) async {
+        var data: [String: Any] = ["isStreaming": false, "messageCount": path == nil ? 0 : 1,
+                                   "model": ["provider": "fixture", "id": model], "thinkingLevel": thinking]
+        if let path { data["sessionFile"] = path }
+        await reply(command, data: data)
     }
 
     func drain() async { try? await Task.sleep(for: .milliseconds(30)) }
 }
 
 @MainActor
+private final class FixtureGateway {
+    let privateKey = Curve25519.KeyAgreement.PrivateKey()
+    private(set) var currentSocket: CommandSocket?
+
+    func openSocket() -> CommandSocket {
+        let socket = CommandSocket(gateway: privateKey)
+        currentSocket = socket
+        return socket
+    }
+}
+
+@MainActor
 private final class CommandSocket: RelaySocket {
-    let gateway = Curve25519.KeyAgreement.PrivateKey()
+    let gateway: Curve25519.KeyAgreement.PrivateKey
+    init(gateway: Curve25519.KeyAgreement.PrivateKey) { self.gateway = gateway }
     var key: E2EKey?
     var commands: [[String: Any]] = []
     func resume() {}

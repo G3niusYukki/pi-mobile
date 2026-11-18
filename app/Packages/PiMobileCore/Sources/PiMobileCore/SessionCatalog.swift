@@ -23,18 +23,30 @@ public struct PiSessionEntry: Identifiable {
             modified = nil
         }
 
-        let topic = (session["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let preview = (session["summary"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !topic.isEmpty && !Self.isLegacyFilename(topic) {
-            title = topic
-        } else if !preview.isEmpty {
-            title = preview
+        let topic = Self.catalogPart(session["title"])
+        let preview = Self.catalogPart(session["summary"])
+        if !topic.text.isEmpty && !Self.isLegacyFilename(topic.text) {
+            title = topic.text
+        } else if !preview.text.isEmpty {
+            title = preview.text
+        } else if topic.hadHint || preview.hadHint {
+            title = "图片讨论"
         } else if let modified {
             title = "会话 · \(modified.formatted(date: .abbreviated, time: .shortened))"
         } else {
             title = "未命名会话"
         }
-        summary = preview.isEmpty || preview == title ? nil : preview
+        summary = preview.text.isEmpty || preview.text == title ? nil : preview.text
+    }
+
+    private static func catalogPart(_ value: Any?) -> (text: String, hadHint: Bool) {
+        let raw = (value as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        // Older gateways split the dimension note at the first period and clipped the topic to 48 characters.
+        if raw.wholeMatch(of: #/\[Image: original [0-9]+x[0-9]+, displayed at (?:[0-9]*(?:x[0-9]*)?…|[0-9]+x[0-9]+\.?)/#) != nil ||
+            raw.wholeMatch(of: #/Multiply coordinates by [0-9]+\.[0-9]+ to map to original image\.\]/#) != nil {
+            return ("", true)
+        }
+        return ChatAttachments.caption(raw)
     }
 
     private static func isLegacyFilename(_ topic: String) -> Bool {

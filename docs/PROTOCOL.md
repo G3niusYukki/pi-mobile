@@ -35,7 +35,8 @@ gateway → client：
 ```
 
 - 网关将原生命令写入 Pi 的 stdin，并将响应关联到手机请求的 `id`。聊天与工具事件仅发送公开文字和生命周期字段，剔除结构化思考块、签名及原始快照。手机也从旧版网关的事件中只提取文字块。
-- client 必须订阅事件后再发 prompt；`agent_settled` 作为「本轮自动工作结束」的信号。
+- `run_phase` 的 `phase` 可为 `thinking` 或 `preparing_tool`，分别来自 Pi 的阶段开始事件。工具执行由 `tool_execution_start`、`tool_execution_update` 和 `tool_execution_end` 驱动，以 `toolCallId` 合并。只有结束事件或历史中的工具结果可以确认完成或失败。
+- client 必须订阅事件后再发 prompt。`agent_settled` 表示本轮自动工作结束。
 - 图片附件走 `prompt.images`（base64 + mimeType），网关按解码后的数据大小限制为每张 2 MiB。
 
 ## 会话切换、恢复与历史
@@ -49,6 +50,8 @@ gateway → client：
 - `session_catalog` 是只读网关命令，返回 `data.sessions`，最多 50 项，按最近活动排序。每项包含 `path`、完整工作目录 `cwd`、毫秒时间戳 `mtime`、话题 `title` 和简述 `summary`。网关在 Mac 本地从当前分支提取文字，手机按 `cwd` 分组，使用 `path` 打开会话。旧版 `session_list` 仅返回文件元数据。
 - `session_history` 是网关扩展命令：`{ "type": "session_history", "id": "…", "sessionPath": "…", "anchorId": "可选的上一条已知持久消息 ID" }`。成功返回 `{ sessionPath, messages, hasEarlierMessages }`；文件不存在、路径非法等错误返回 `success: false`，不伪装为空会话。
 - 历史仅包含当前分支。消息含稳定 `id`、`role`、完整 `text`；工具消息另含 `toolTitle` 及已有记录的 `toolCallId`，用于合并流式结果。默认返回最近 80 条；同分支的旧 `anchorId` 可将窗口扩展到该消息，使客户端保留阅读前缀。其他分支或无效锚点不会引入旧分支内容。
+- 用户图片作为可选的 `attachments` 数组随加密历史返回。每次历史响应优先为最近的图片分配共 2 MiB 原始数据的预算。没有可用图像数据时保留图片占位。只有 Pi 追加的终端尺寸说明会从用户文字中移除。
+- 工具结果可包含 `isError: true`。有 `toolCallId` 的空输出也会返回，用于确认工具的终态。
 - 正文不做展示层截断；整体传输仍受 relay 的 12 MiB WebSocket 载荷上限约束。历史窗口不是无限量分页接口。
 
 ## 安全

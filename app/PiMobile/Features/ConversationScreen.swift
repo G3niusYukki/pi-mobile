@@ -3,27 +3,12 @@ import PhotosUI
 import UIKit
 import PiMobileCore
 
-enum ConversationTab: Hashable {
-    case chat, trace
-
-    func messages(in history: [ChatMessage]) -> [ChatMessage] {
-        switch self {
-        case .chat: history.filter { $0.role != .tool && ($0.role != .assistant || !$0.text.isEmpty) }
-        case .trace: history.filter { $0.role == .tool }
-        }
-    }
-
-    static func waitsForReply(in history: [ChatMessage], connection: ConnectionState) -> Bool {
-        guard connection == .running else { return false }
-        return history.last?.role != .assistant || history.last?.text.isEmpty == true
-    }
-}
-
 struct ConversationScreen: View {
     @EnvironmentObject var model: AppModel
     let onSettings: () -> Void
     @FocusState private var focused: Bool
     @State private var photoItem: PhotosPickerItem?
+    @State private var photoError: String?
     @State private var tab: ConversationTab = .chat
     @State private var showsSidebar = false
     @State private var sidebarSearch = ""
@@ -53,6 +38,9 @@ struct ConversationScreen: View {
         }
         .onChange(of: model.selectedSessionPath) { _, _ in focused = false }
         .onDisappear { focused = false }
+        .alert("图片未发送", isPresented: Binding(get: { photoError != nil }, set: { if !$0 { photoError = nil } })) {
+            Button("好") { photoError = nil }
+        } message: { Text(photoError ?? "") }
         .confirmationDialog("清除本机配对并重新扫码？", isPresented: $showsPairingReset, titleVisibility: .visible) {
             Button("清除配对", role: .destructive) { model.resetPairing() }
             Button("取消", role: .cancel) {}
@@ -233,64 +221,53 @@ struct ConversationScreen: View {
     // MARK: - 内容
 
     private var content: some View {
-        let timelineMessages = tab.messages(in: model.messages)
+        let rows = tab.rows(in: model.messages)
         return VStack(spacing: 0) {
             if model.isLoadingHistory {
                 HStack(spacing: 8) {
-                    ProgressView().controlSize(.small).tint(Theme.ocean)
+                    ProgressView().controlSize(.small)
                     Text("正在加载会话…")
                     Spacer()
                 }
                 .appFont(.caption)
-                .foregroundStyle(Theme.textSecondary)
+                .foregroundStyle(.secondary)
                 .padding(.horizontal, 20)
-                .padding(.vertical, 10)
+                .padding(.vertical, 8)
             }
-            ConversationTimeline(
-                storageKey: timelineKey,
-                messageIDs: timelineMessages.map(\.id),
-                isLoading: model.isLoadingHistory
-            ) {
+            ConversationTimeline(storageKey: timelineKey, messageIDs: rows.map(\.id), isLoading: model.isLoadingHistory) {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    if tab == .chat {
-                        if timelineMessages.isEmpty, !model.isLoadingHistory, model.connection != .running {
-                            if let error = model.errorMessage {
-                                ContentUnavailableView("会话暂不可用", systemImage: "exclamationmark.bubble", description: Text(error))
-                            } else {
-                                EmptyConversationView()
-                            }
-                        } else {
-                            ForEach(timelineMessages) { message in
-                                MessageBubble(message: message)
-                                    .id(message.id)
-                            }
+                    if rows.isEmpty, !model.isLoadingHistory {
+                        if tab == .trace {
+                            Label("暂无工具调用", systemImage: "wrench.and.screwdriver")
+                                .appFont(.subheadline).foregroundStyle(.secondary).padding(.vertical, 16)
+                        } else if model.connection != .running, model.errorMessage == nil {
+                            EmptyConversationView()
                         }
+                    }
+                    ForEach(rows) { row in
+                        switch row {
+                        case .message(let message):
+                            MessageBubble(message: message).id(row.id)
+                        case .tools(let steps):
+                            ToolActivityRow(group: steps, showsOutput: tab == .trace).id(row.id)
+                        }
+                    }
+                    if tab == .chat {
                         if let approval = model.approvals.first {
-                            ApprovalCard(request: approval) { confirmed in
-                                model.answer(approval, confirmed: confirmed)
-                            }
-                            .reservedRegionAware()
-                        } else if !model.isLoadingHistory, ConversationTab.waitsForReply(in: model.messages, connection: model.connection) {
+                            ApprovalCard(request: approval) { model.answer(approval, confirmed: $0) }
+                                .reservedRegionAware()
+                        } else if !model.isLoadingHistory, let label = ConversationTab.activityLabel(in: model.messages, connection: model.connection, phase: model.runPhase) {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.mini).accessibilityHidden(true)
-                                Text("等待回复…").appFont(.footnote)
+                                Text(label).appFont(.footnote)
                             }
+                            .padding(.vertical, 4)
                             .foregroundStyle(.secondary)
                             .accessibilityElement(children: .combine)
                         }
-                    } else if timelineMessages.isEmpty, !model.isLoadingHistory {
-                        Label("暂无工具调用轨迹", systemImage: "waveform.path.ecg")
-                            .appFont(.subheadline)
-                            .foregroundStyle(Theme.textSecondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(16)
-                    } else {
-                        ForEach(timelineMessages) { message in
-                            MessageBubble(message: message)
-                                .id(message.id)
-                        }
                     }
                 }
+                .padding(.top, 8)
                 .padding(.horizontal, 16)
                 .padding(.bottom, 16)
                 .frame(maxWidth: PiAdaptiveLayout.pageWidth)
@@ -308,53 +285,45 @@ struct ConversationScreen: View {
     // MARK: - 输入区
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        HStack(alignment: .bottom, spacing: 4) {
+            attachmentButton
             TextField("给 Pi 发消息", text: $model.draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .appFont(.body)
                 .foregroundStyle(.primary)
                 .focused($focused)
                 .lineLimit(1...5)
-                .frame(minHeight: 32, alignment: .leading)
+                .padding(.vertical, 9)
+                .frame(minHeight: 44, alignment: .leading)
                 .accessibilityIdentifier("composer-input")
-            HStack(spacing: 7) {
-                attachmentButton
-                if focused {
-                    Button { focused = false } label: {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                            .appFont(.system(size: 17))
-                            .frame(width: 44, height: 44)
-                    }
-                    .accessibilityLabel("收起键盘")
+            if focused {
+                Button { focused = false } label: {
+                    Image(systemName: "keyboard.chevron.compact.down").frame(width: 44, height: 44)
                 }
-                Spacer(minLength: 2)
-                modelControl
-                Button {
-                    if showsStopButton {
-                        model.stop()
-                    } else if model.send() {
-                        focused = false
-                    }
-                } label: {
-                    Image(systemName: showsStopButton ? "stop.fill" : "arrow.up")
-                        .appFont(.system(size: showsStopButton ? 14 : 17, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
-                        .background(actionEnabled ? Theme.ocean : Color(uiColor: .systemGray), in: Circle())
-                }
-                .buttonStyle(bouncy())
-                .accessibilityLabel(showsStopButton ? "停止生成" : model.connection == .running ? "发送补充消息" : "发送消息")
-                .accessibilityIdentifier("composer-action")
-                .disabled(!actionEnabled)
+                .accessibilityLabel("收起键盘")
+            } else { modelControl }
+            Button {
+                if showsStopButton { model.stop() }
+                else if model.send() { focused = false }
+            } label: {
+                Image(systemName: showsStopButton ? "stop.fill" : "arrow.up")
+                    .appFont(.system(size: showsStopButton ? 13 : 16, weight: .bold))
+                    .foregroundStyle(actionEnabled ? .white : Color.secondary)
+                    .frame(width: 32, height: 32)
+                    .background(actionEnabled ? Theme.ocean : Color(uiColor: .tertiarySystemFill), in: Circle())
+                    .frame(width: 44, height: 44)
             }
-            .foregroundStyle(.secondary)
+            .accessibilityLabel(showsStopButton ? "停止生成" : model.connection == .running ? "发送补充消息" : "发送消息")
+            .accessibilityIdentifier("composer-action")
+            .disabled(!actionEnabled)
         }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 22))
         .padding(.horizontal, 14)
-        .padding(.top, 14)
-        .padding(.bottom, 4)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
-        .padding(.horizontal, 14)
-        .padding(.bottom, 8)
+        .padding(.top, 4)
+        .padding(.bottom, 6)
         .frame(maxWidth: PiAdaptiveLayout.pageWidth)
         .frame(maxWidth: .infinity)
         .reservedRegionAware()
@@ -377,17 +346,23 @@ struct ConversationScreen: View {
         .buttonStyle(bouncy())
         .accessibilityLabel("发送图片")
         .disabled(!model.canSend)
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
-            Task {
-                guard let data = try? await item.loadTransferable(type: Data.self),
-                      let image = UIImage(data: data) else { return }
-                let compressed = image.jpegData(compressionQuality: 0.7) ?? data
-                if model.send(image: compressed) {
-                    focused = false
-                    photoItem = nil
-                }
+        .task(id: photoItem) {
+            guard let item = photoItem else { return }
+            let destination = model.conversationID
+            defer { if !Task.isCancelled { photoItem = nil } }
+            guard let data = try? await item.loadTransferable(type: Data.self), !Task.isCancelled else {
+                if !Task.isCancelled { photoError = "无法从照片图库读取图片，请再选一次。" }
+                return
             }
+            let jpeg = await Task.detached(priority: .userInitiated) { ChatAttachments.promptJPEG(from: data) }.value
+            guard !Task.isCancelled else { return }
+            guard let jpeg else { photoError = "无法读取这张图片，请换一张后重试。"; return }
+            guard model.conversationID == destination, !model.isLoadingHistory else {
+                photoError = "会话已切换，请在当前会话重新选择图片。"
+                return
+            }
+            if model.send(image: jpeg) { focused = false }
+            else { photoError = "会话暂时无法发送，请在连接恢复后重试。" }
         }
     }
 
@@ -418,8 +393,12 @@ struct ConversationScreen: View {
             }
         } label: {
             HStack(spacing: 5) {
-                Text(modelName).lineLimit(1).layoutPriority(-1)
-                Image(systemName: "chevron.down").appFont(.caption2)
+                if availableSize.width >= 480 {
+                    Text(modelName).lineLimit(1).truncationMode(.tail).frame(maxWidth: 160, alignment: .trailing)
+                    Image(systemName: "chevron.down").appFont(.caption2)
+                } else {
+                    Image(systemName: "slider.horizontal.3").appFont(.body).frame(width: 44)
+                }
             }
             .appFont(.caption.weight(.medium))
             .frame(minHeight: 44)
@@ -440,42 +419,31 @@ private struct MessageBubble: View {
     let message: ChatMessage
 
     var body: some View {
-        VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 7) {
-            switch message.role {
-            case .user:
-                Text(message.text)
-                    .textSelection(.enabled)
-                    .appFont(.body)
-                    .foregroundStyle(.primary)
-                    .padding(10)
-                    .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 15))
-            case .assistant:
-                MarkdownLiteText(markdown: message.text, streaming: message.streaming)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            case .tool:
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(message.toolTitle ?? "工具", systemImage: "wrench.and.screwdriver")
-                        .appFont(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+        Group {
+            if message.role == .user {
+                VStack(alignment: .trailing, spacing: 5) {
+                    ForEach(Array(message.attachments.enumerated()), id: \.offset) { _, attachment in
+                        ChatPhotoView(attachment: attachment)
+                    }
                     if !message.text.isEmpty {
-                        Text(message.text)
-                            .textSelection(.enabled)
-                            .appFont(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                        Text(message.text).textSelection(.enabled).appFont(.body)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 15))
                     }
                 }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 11))
-            }
-            if !message.text.isEmpty {
-                PiCopyButton(text: message.text, title: "复制全文")
-                    .labelStyle(.iconOnly)
+                .padding(.leading, 34)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                MarkdownLiteText(markdown: message.text, streaming: message.streaming)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(.leading, message.role == .user ? 34 : 0)
-        .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
-        .padding(.vertical, 6)
+        .contextMenu {
+            if !message.text.isEmpty {
+                Button("复制全文", systemImage: "doc.on.doc") { UIPasteboard.general.string = message.text }
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 

@@ -37,7 +37,14 @@ public final class RelayClient: ObservableObject {
     private var reconnectDelay: UInt64 = 1_000_000_000
 
     public convenience init(endpoint: String? = nil) {
-        self.init(endpoint: endpoint, store: .keychain) { RelaySession.shared.webSocketTask(with: $0) }
+        self.init(endpoint: endpoint, store: .keychain, makeSocket: Self.webSocket)
+    }
+
+    static func webSocket(for request: URLRequest) -> URLSessionWebSocketTask {
+        let task = RelaySession.shared.webSocketTask(with: request)
+        // The relay accepts 12 MiB frames, including encrypted history with photos.
+        task.maximumMessageSize = 12 * 1024 * 1024
+        return task
     }
 
     init(endpoint: String?, store: PairingStore, makeSocket: @escaping (URLRequest) -> any RelaySocket) {
