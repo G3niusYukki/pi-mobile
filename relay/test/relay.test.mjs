@@ -90,8 +90,15 @@ test("relay：配对 → rpc 双向路由 → 心跳与鉴权", async () => {
     // 设备令牌可复用，且重连后可收到事件
     gw.send(JSON.stringify({ type: "event", event: { type: "agent_settled" } }))
     await next(phone, (m) => m.type === "event" && m.event.type === "agent_settled")
-    phone.close()
+    const offline = next(phone, (m) => m.type === "status" && m.state === "unknown")
     gw.close()
+    await offline
+    const recovered = next(phone, (m) => m.type === "status" && m.state === "idle")
+    const replacement = connect(`${base}/gateway`, { Authorization: `Bearer ${TOKEN}` })
+    await open(replacement)
+    await recovered
+    phone.close()
+    replacement.close()
   } finally {
     relay.kill()
   }

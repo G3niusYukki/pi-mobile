@@ -233,6 +233,15 @@ async function connectGateway(t, fakeEnv = {}) {
       assert.deepEqual(Object.keys(envelope).sort(), ["sealed", "type"], "RPC 内容应全部加密")
       return phoneCrypto.open(envelope.sealed)
     },
+    collectEventsUntil(type) {
+      const events = []
+      return waitMessage(phone, (message) => {
+        if (message.type !== "event") return false
+        const event = phoneCrypto.open(message.sealed)
+        events.push(event)
+        return event.type === type
+      }).then(() => events)
+    },
     async event(type) {
       const envelope = await waitMessage(phone, (message) => message.type === "event"
         && typeof message.sealed === "string" && phoneCrypto.open(message.sealed).type === type)
@@ -244,6 +253,23 @@ async function connectGateway(t, fakeEnv = {}) {
     },
   }
 }
+
+test("native transcript RPC projects only visible assistant content", async t => {
+  const gateway = await connectGateway(t)
+  const response = await gateway.rpc({ id: "msgs", type: "get_messages" })
+  assert.deepEqual(response.data.messages, [{ role: "assistant", content: [{ type: "text", text: "answer" }] }])
+})
+
+test("decrypted phone events exclude Pi thinking across partials, finals and run summaries", async t => {
+  const gateway = await connectGateway(t)
+  const delivery = gateway.collectEventsUntil("agent_settled")
+  await gateway.rpc({ id: "privacy", type: "prompt", message: "synthetic privacy fixture" })
+  const events = await delivery
+  assert.doesNotMatch(JSON.stringify(events), /fixture-private/)
+  assert.equal(events.find(e => e.assistantMessageEvent?.type === "text_delta").assistantMessageEvent.delta, "思考：<think>literal</think>")
+  assert.deepEqual(events.find(e => e.type === "tool_execution_end").result.content, [{ type: "text", text: "tool output" }])
+  assert.deepEqual(events.find(e => e.type === "message_end" && e.message.role === "assistant").message.content, [{ type: "text", text: "思考：<think>literal</think>" }])
+})
 
 test("会话目录：加密返回工作目录、话题与进展，旧接口仅返回文件元数据", async (t) => {
   const gateway = await connectGateway(t)
@@ -359,6 +385,36 @@ test("gateway：加密历史锚点跨过 80 条后台新增，分支变更不保
   assert.equal(branched.data.hasEarlierMessages, false)
   gateway.checkLogs()
 })
+
+for (const change of [
+  { type: "set_model", provider: "fixture", modelId: "new-model" },
+  { type: "set_thinking_level", level: "high" },
+]) {
+  test(`gateway：setting barrier waits for ${change.type} across reconnect`, { timeout: 20000 }, async (t) => {
+    const gateway = await connectGateway(t)
+    const confirmation = gateway.event("extension_ui_request")
+    gateway.sendRpc({ id: "mutation", ...change })
+    const hook = await confirmation
+    await gateway.reconnect()
+    let received = false
+    const snapshot = gateway.rpc({ id: "recover", type: "get_state", afterSettingChangeId: "mutation" }).then((value) => {
+      received = true
+      return value
+    })
+    const probe = await gateway.rpc({ id: "probe", type: "barrier_probe" })
+    assert.equal(probe.error, "Unknown command: barrier_probe")
+    assert.equal(received, false, "state must wait for pending native mutation")
+    gateway.confirm(hook.id)
+    const state = await snapshot
+    assert.equal(state.success, true)
+    assert.equal(state.data.settingBarrierId, "mutation")
+    assert.equal(state.data.sessionBarrier, true)
+    assert.equal(state.data.sessionBarrierId, undefined)
+    if (change.type === "set_model") assert.deepEqual(state.data.model, { provider: change.provider, id: change.modelId })
+    else assert.equal(state.data.thinkingLevel, change.level)
+    gateway.checkLogs()
+  })
+}
 
 for (const scenario of [
   { name: "重连后的切换", type: "switch_session", reconnect: true, changed: true },

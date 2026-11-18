@@ -85,6 +85,20 @@ final class WhalenessInterfaceTests: XCTestCase {
         try await eventually { abs(measurement.height - initial) < 2 }
     }
 
+    func testTranscriptSeparatesRepliesFromTraceDuringAToolCall() {
+        let user = ChatMessage(role: .user, text: "整理路线")
+        let pending = ChatMessage(role: .assistant, text: "", streaming: true)
+        let tool = ChatMessage(role: .tool, text: "2 条记录")
+        let reply = ChatMessage(role: .assistant, text: "建议先去公园。", streaming: true)
+        let history = [user, pending, tool]
+        XCTAssertEqual(ConversationTab.chat.messages(in: history), [user])
+        XCTAssertEqual(ConversationTab.trace.messages(in: history), [tool])
+        XCTAssertTrue(ConversationTab.waitsForReply(in: history, connection: .running))
+        XCTAssertFalse(ConversationTab.waitsForReply(in: history, connection: .paired))
+        XCTAssertEqual(ConversationTab.chat.messages(in: history + [reply]), [user, reply])
+        XCTAssertFalse(ConversationTab.waitsForReply(in: history + [reply], connection: .running))
+    }
+
     func testWorkspaceAdaptsToDuoAndAccessibilitySizes() {
         XCTAssertFalse(PiAdaptiveLayout.workspaceUsesColumns(size: CGSize(width: 390, height: 844)))
         XCTAssertTrue(PiAdaptiveLayout.workspaceUsesColumns(size: CGSize(width: 1024, height: 768)))
@@ -98,20 +112,26 @@ final class WhalenessInterfaceTests: XCTestCase {
         let store = ConversationScrollStore()
         let narrow = CGSize(width: 390, height: 844)
         let wide = CGSize(width: 1024, height: 768)
-        try await snapshot("workspace-narrow", size: narrow, style: .dark, model: model, store: store) {
+        try await snapshot("workspace-narrow", size: narrow, style: .light, model: model, store: store) {
             SessionsPane(onSettings: {})
         }
         try await snapshot("workspace-wide", size: wide, style: .dark, model: model, store: store) {
             SessionsPane(onSettings: {})
         }
-        model.errorMessage = nil
-        XCTAssertEqual(model.messages.count, 2, "Rendered conversation must contain the supplied history")
+        model.clearError()
+        XCTAssertEqual(ConversationTab.chat.messages(in: model.messages).count, 2, "Rendered conversation must contain the supplied history")
         try await snapshot("conversation-light", size: narrow, style: .light, model: model, store: store) {
             ConversationScreen(onSettings: {})
         }
         try await snapshot("conversation-dark-wide", size: wide, style: .dark, model: model, store: store) {
             ConversationScreen(onSettings: {})
         }
+        model.messages.append(ChatMessage(role: .user, text: "如果下雨，有室内的备选吗？"))
+        model.connection = .running
+        try await snapshot("conversation-waiting", size: narrow, style: .dark, model: model, store: store) {
+            ConversationScreen(onSettings: {})
+        }
+        model.connection = .paired
         try await snapshot("settings-light", size: narrow, style: .light, model: model, store: store) {
             PiSettingsView(open: { _ in })
         }
@@ -128,22 +148,25 @@ final class WhalenessInterfaceTests: XCTestCase {
         let model = AppModel()
         // Let the initial disconnected publisher settle before applying synthetic history.
         await settle()
+        model.connection = .paired
         model.selectedSessionPath = "/preview/pi-session.jsonl"
-        model.selectedSessionTitle = "Pi 界面设计"
+        model.selectedSessionTitle = "周六骑行路线"
         model.models = [
             ModelOption(provider: "OpenAI", modelId: "gpt-6-astra", displayName: "GPT-6 Astra"),
             ModelOption(provider: "OpenAI", modelId: "gpt-5.4", displayName: "GPT-5.4"),
             ModelOption(provider: "Anthropic", modelId: "claude-opus-4-7", displayName: "Claude Opus 4.7"),
         ]
         model.selectedModel = model.models[0].id
+        let now = Date().timeIntervalSince1970 * 1_000
         model.sessions = [
-            ["path": "/preview/pi-session.jsonl", "title": "Pi 界面设计", "cwd": "/projects/pi-mobile", "summary": "工作区按文件夹归类，会话浮窗也能搜索讨论内容。"],
-            ["path": "/preview/session-two.jsonl", "title": "检查代码并完成测试", "cwd": "/projects/pi-mobile"],
-            ["path": "/preview/session-three.jsonl", "title": "整理本周的开发计划", "cwd": "/projects/workspace"],
+            ["path": "/preview/pi-session.jsonl", "title": "周六骑行路线", "cwd": "/projects/weekend", "summary": "沿河骑到植物园，午饭前回到车站。", "mtime": now - 600_000],
+            ["path": "/preview/session-two.jsonl", "title": "野餐采购清单", "cwd": "/projects/weekend", "summary": "按四人份整理食材和饮料。", "mtime": now - 7_200_000],
+            ["path": "/preview/session-three.jsonl", "title": "调整文章目录", "cwd": "/projects/field-notes", "summary": "把春季观察单独整理成一章。", "mtime": now - 86_400_000],
         ]
         model.messages = [
-            ChatMessage(role: .user, text: "参考 Whaleness 的界面，布局和设置复用，品牌换成 Pi。"),
-            ChatMessage(role: .assistant, text: "已经统一为 **Pi** 的界面。\n\n- 工作区按屏幕宽度排列\n- 设置和字体调整使用原生导航\n- 对话保留阅读位置\n\n```swift\nText(\"你好，Pi\")\n```"),
+            ChatMessage(role: .user, text: "周六上午从车站出发，想沿河骑一圈。怎么安排比较从容？"),
+            ChatMessage(role: .tool, text: "找到两段沿河路线。", toolTitle: "读取路线笔记"),
+            ChatMessage(role: .assistant, text: "建议走 **车站 → 河堤 → 植物园**，回程沿原路骑。\n\n九点从车站出发，到植物园大约四十分钟。可以在河边停下来吃点东西，十点半折返。\n\n如果风大，就在老桥掉头。这样还能留出时间喝杯咖啡。"),
         ]
         return model
     }

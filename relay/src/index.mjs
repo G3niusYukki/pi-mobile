@@ -92,6 +92,8 @@ wss.on("connection", (ws, req, path) => {
     gateway = ws
     ws.role = "gateway"
     send(ws, { type: "hello", role: "gateway" })
+    // A paired phone can outlive its gateway socket. Resume the key exchange.
+    safeSend(device, { type: "status", state: "idle", needsPairingKey: true })
   } else {
     ws.role = "client"
     if (bearer && devices.has(bearer) && devices.get(bearer).expiresAt > Date.now()) {
@@ -120,7 +122,10 @@ wss.on("connection", (ws, req, path) => {
   })
   ws.on("close", () => {
     if (ws.pairTimer) clearTimeout(ws.pairTimer)
-    if (gateway === ws) gateway = null
+    if (gateway === ws) {
+      gateway = null
+      safeSend(device, { type: "status", state: "unknown" })
+    }
     if (device === ws) {
       device = null
       broadcastToGateway({ type: "device_status", online: false })

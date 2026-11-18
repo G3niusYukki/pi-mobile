@@ -8,8 +8,8 @@ options:
 settings:
   base:
     PI_MOBILE_BUNDLE_ID: dev.example.pimobile
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.1"
+    CURRENT_PROJECT_VERSION: "2"
 
 packages:
   PiMobileCore:

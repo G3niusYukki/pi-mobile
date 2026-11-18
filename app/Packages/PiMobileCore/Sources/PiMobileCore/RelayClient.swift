@@ -3,8 +3,14 @@ import Combine
 
 @MainActor
 public final class RelayClient: ObservableObject {
-    @Published public private(set) var state: ConnectionState = .idle
+    @Published public private(set) var state: ConnectionState = .idle {
+        didSet { onConnectionChange?(state, lastError) }
+    }
     @Published public private(set) var lastError: String?
+
+    /// Runs on the main actor after both socket state and its error are committed.
+    public var onConnectionChange: ((ConnectionState, String?) -> Void)?
+    public var onActionError: ((String) -> Void)?
 
     public var onEvent: (([String: Any]) -> Void)?
     public var onResponse: (([String: Any]) -> Void)?
@@ -60,7 +66,7 @@ public final class RelayClient: ObservableObject {
         let link: PairingLink
         do { link = try PairingLink(token, knownEndpoint: configuredEndpoint ?? store.restore()?.endpoint) }
         catch {
-            if isConnected { lastError = error.localizedDescription }
+            if isConnected { onActionError?(error.localizedDescription) }
             else { fail(error.localizedDescription) }
             return
         }
@@ -110,6 +116,7 @@ public final class RelayClient: ObservableObject {
         socket = nil
         handshake = nil
         e2e = nil
+        lastError = nil
         state = .idle
     }
 
@@ -201,6 +208,7 @@ public final class RelayClient: ObservableObject {
         }
         self.handshake = nil
         e2e = key
+        lastError = nil
         state = .paired
         reconnectDelay = 1_000_000_000
         onPaired?(token)
@@ -231,25 +239,40 @@ public final class RelayClient: ObservableObject {
             if (object["state"] as? String) == "unknown" {
                 lastError = "Mac gateway 离线"
                 state = .error
-            } else {
-                state = (object["state"] as? String) == "running" ? .running : .paired
+            } else if let status = object["state"] as? String, ["idle", "running", "paired"].contains(status) {
+                lastError = nil
+                state = status == "running" ? .running : .paired
             }
         case "event":
             guard let sealed = object["sealed"] as? String, let event = e2e?.open(sealed) else { return }
+            recoverFromAuthenticatedTraffic()
             onEvent?(event)
         case "rpc_response":
             guard let sealed = object["sealed"] as? String, let response = e2e?.open(sealed) else { return }
+            recoverFromAuthenticatedTraffic()
             onResponse?(response)
         case "device_status":
             onDeviceStatus?(object["online"] as? Bool == true)
         case "session_list":
             onSessionList?(object["sessions"] as? [[String: Any]] ?? [])
         case "error":
-            lastError = object["message"] as? String
-            state = .error
+            let message = object["message"] as? String ?? "连接出错"
+            if message == "gateway offline" || message == "not paired" || message.contains("配对") || message.contains("密钥") {
+                lastError = message == "gateway offline" ? "Mac gateway 离线" : message
+                state = .error
+            } else {
+                onActionError?(message)
+            }
         default:
             break
         }
+    }
+
+    // Older relays may deliver the first real reply without a fresh presence frame.
+    private func recoverFromAuthenticatedTraffic() {
+        guard state == .error || lastError != nil else { return }
+        lastError = nil
+        state = .paired
     }
 
     public enum ClientError: Error {

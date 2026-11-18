@@ -6,6 +6,8 @@ process.stdin.setEncoding("utf8")
 let buffer = ""
 let isStreaming = false
 let pendingMessageCount = 0
+let model
+let thinkingLevel
 let sessionFile
 let newSessionCount = 0
 const output = (record) => process.stdout.write(`${JSON.stringify(record)}\n`)
@@ -39,11 +41,43 @@ async function handle(cmd) {
         isStreaming = true
         reply({ disposition: "started" })
         output({ type: "agent_start" })
-        output({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "pong" } })
+        if (cmd.message === "synthetic privacy fixture") {
+          const hidden = { type: "thinking", thinking: "fixture-private-thought", thinkingSignature: "fixture-private-signature" }
+          const message = { role: "assistant", content: [hidden, { type: "text", text: "思考：<think>literal</think>" }] }
+          output({ type: "message_start", message })
+          for (const update of [
+            { type: "thinking_delta", delta: hidden.thinking }, { type: "thinking_end", content: hidden.thinking },
+            { type: "text_delta", contentIndex: 1, delta: message.content[1].text },
+          ]) output({ type: "message_update", message, assistantMessageEvent: { ...update, partial: message } })
+          const result = { content: [{ type: "text", text: "tool output" }], details: { messages: [message] } }
+          output({ type: "tool_execution_end", toolCallId: "call1", toolName: "read", result })
+          output({ type: "message_end", message: { role: "toolResult", toolCallId: "call1", ...result } })
+          output({ type: "entry_appended", entry: { type: "message", message } })
+          output({ type: "message_end", message })
+          output({ type: "turn_end", message, toolResults: [] })
+          output({ type: "agent_end", messages: [message] })
+          output({ type: "agent_settled" })
+          isStreaming = false
+        } else output({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "pong" } })
       }
       break
+    case "get_messages":
+      reply({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "fixture-private" }, { type: "text", text: "answer" }] }] })
+      break
     case "get_state":
-      reply({ isStreaming, isCompacting: false, sessionFile, pendingMessageCount })
+      if (Object.hasOwn(cmd, "afterSettingChangeId")) fail("Gateway-only field reached Pi")
+      else reply({ isStreaming, isCompacting: false, sessionFile, pendingMessageCount, model, thinkingLevel })
+      break
+    case "set_model":
+    case "set_thinking_level":
+      await new Promise((resolve) => {
+        const id = `confirm-${cmd.id}`
+        pendingConfirmations.set(id, resolve)
+        output({ type: "extension_ui_request", id, method: "confirm", title: "Setting change" })
+      })
+      if (cmd.type === "set_model") model = { provider: cmd.provider, id: cmd.modelId }
+      else thinkingLevel = cmd.level
+      reply()
       break
     case "switch_session":
     case "new_session": {

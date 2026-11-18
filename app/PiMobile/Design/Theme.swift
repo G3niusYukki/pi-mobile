@@ -1,7 +1,7 @@
 import SwiftUI
 import PiMobileCore
 
-// MARK: - 视觉语言（参考 dsh-mobile 的 Deep Ocean）
+// MARK: - Pi colors and system surfaces
 
 enum Theme {
     static let navy = Color(red: 0.027, green: 0.094, blue: 0.169)
@@ -15,8 +15,8 @@ enum Theme {
     static let coral = Color(red: 0.93, green: 0.33, blue: 0.30)
     static let purple = Color(red: 0.48, green: 0.33, blue: 0.78)
 
-    static let bgSolid = navyDeep
-    static let sidebarBG = navyDeep
+    static let bgSolid = Color(uiColor: .systemBackground)
+    static let sidebarBG = Color(uiColor: .secondarySystemBackground)
     static let inputFill = Color.primary.opacity(0.06)
 
     static let cardFill = Color.primary.opacity(0.055)
@@ -36,73 +36,9 @@ enum Theme {
     static func background() -> some View { PiBackground() }
 }
 
-/// 深海军蓝 + 极细技术网格 + 顶部冷光，避开折痕区域。
 struct PiBackground: View {
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [Theme.navy, Theme.navyDeep, Color.black],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            PiTechnicalGrid()
-            RadialGradient(
-                colors: [Theme.ocean.opacity(0.24), .clear],
-                center: .init(x: 0.72, y: 0.12),
-                startRadius: 20,
-                endRadius: 520
-            )
-            .blendMode(.screen)
-            LinearGradient(
-                colors: [.clear, Theme.navyDeep.opacity(0.35), Color.black.opacity(0.55)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-}
-
-private struct PiTechnicalGrid: View {
-    var body: some View {
-        Canvas { context, size in
-            let spacing: CGFloat = 42
-            var path = Path()
-            for x in stride(from: -spacing, through: size.width + spacing, by: spacing) {
-                path.move(to: CGPoint(x: x, y: 0))
-                path.addLine(to: CGPoint(x: x, y: size.height))
-            }
-            for y in stride(from: -spacing, through: size.height + spacing, by: spacing) {
-                path.move(to: CGPoint(x: 0, y: y))
-                path.addLine(to: CGPoint(x: size.width, y: y))
-            }
-            context.stroke(path, with: .color(.white.opacity(0.045)), lineWidth: 0.6)
-
-            let columns = Int(ceil(size.width / spacing)) + 1
-            let rows = Int(ceil(size.height / spacing)) + 1
-            for row in 0..<rows {
-                for column in 0..<columns where (row * 11 + column * 7) % 13 == 0 {
-                    let point = CGPoint(x: CGFloat(column) * spacing, y: CGFloat(row) * spacing)
-                    context.fill(
-                        Path(CGRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2)),
-                        with: .color(.white.opacity(0.08))
-                    )
-                }
-            }
-        }
-        .mask(
-            LinearGradient(
-                stops: [
-                    .init(color: .white.opacity(0.8), location: 0),
-                    .init(color: .white, location: 0.55),
-                    .init(color: .clear, location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
+        Theme.bgSolid.ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
     }
 }
 
@@ -142,7 +78,6 @@ struct GlassSurface: ViewModifier {
                     RoundedRectangle(cornerRadius: radius, style: .continuous)
                         .strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
                 )
-                .shadow(color: Theme.navy.opacity(0.35), radius: 16, y: 8)
         }
     }
 }
@@ -173,16 +108,10 @@ struct PiMark: View {
 struct PiWordmark: View {
     var body: some View {
         HStack(spacing: 8) {
-            PiMark(size: 30)
+            PiMark(size: 30).accessibilityHidden(true)
             Text("Pi")
                 .appFont(.title3.bold())
                 .foregroundStyle(Theme.textPrimary)
-            Text("MOBILE")
-                .appFont(.caption2.bold())
-                .foregroundStyle(Theme.textPrimary.opacity(0.85))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(.white.opacity(0.14)))
         }
     }
 }
@@ -215,7 +144,6 @@ struct PiStatusPill: View {
     var body: some View {
         HStack(spacing: 6) {
             Circle().fill(color).frame(width: 7, height: 7)
-                .shadow(color: color.opacity(0.7), radius: 4)
             Text(text)
                 .appFont(.caption.weight(.semibold))
                 .foregroundStyle(Theme.textPrimary)
@@ -294,11 +222,12 @@ struct PiSearchField: View {
                         .foregroundStyle(Theme.textTertiary)
                 }
                 .buttonStyle(bouncy())
+                .accessibilityLabel("清空搜索")
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .piGlassCard(radius: 16)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 

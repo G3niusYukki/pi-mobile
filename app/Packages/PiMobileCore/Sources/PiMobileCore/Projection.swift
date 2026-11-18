@@ -19,9 +19,6 @@ public enum PiProjection {
         switch type {
         case "text_delta":
             return (update["delta"] as? String, nil)
-        case "thinking_delta":
-            guard let piece = update["delta"] as? String else { return (nil, nil) }
-            return ("思考：\(piece)", nil)
         case "toolcall_start":
             let name = update["toolName"] as? String ?? "工具"
             return (nil, name)

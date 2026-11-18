@@ -3,13 +3,24 @@ import PhotosUI
 import UIKit
 import PiMobileCore
 
-private enum ConversationTab: Hashable {
+enum ConversationTab: Hashable {
     case chat, trace
+
+    func messages(in history: [ChatMessage]) -> [ChatMessage] {
+        switch self {
+        case .chat: history.filter { $0.role != .tool && ($0.role != .assistant || !$0.text.isEmpty) }
+        case .trace: history.filter { $0.role == .tool }
+        }
+    }
+
+    static func waitsForReply(in history: [ChatMessage], connection: ConnectionState) -> Bool {
+        guard connection == .running else { return false }
+        return history.last?.role != .assistant || history.last?.text.isEmpty == true
+    }
 }
 
 struct ConversationScreen: View {
     @EnvironmentObject var model: AppModel
-    @Environment(\.colorScheme) private var colorScheme
     let onSettings: () -> Void
     @FocusState private var focused: Bool
     @State private var photoItem: PhotosPickerItem?
@@ -80,18 +91,10 @@ struct ConversationScreen: View {
                 Text("轨迹").tag(ConversationTab.trace)
             }
         } label: {
-            VStack(spacing: 3) {
-                HStack(spacing: 5) {
-                    Text(model.selectedSessionTitle ?? "Pi")
-                        .appFont(.headline).lineLimit(1)
-                    Image(systemName: "chevron.down").appFont(.system(size: 9, weight: .semibold))
-                }
-                HStack(spacing: 4) {
-                    Circle().fill(model.connection == .running ? Theme.amber : model.isConnected ? Theme.success : .gray)
-                        .frame(width: 5, height: 5)
-                    Text(tab == .trace ? "轨迹" : model.connection == .running ? "Pi 工作中" : "端到端加密")
-                        .appFont(.caption2).foregroundStyle(.secondary)
-                }
+            HStack(spacing: 5) {
+                Text(tab == .trace ? "工具轨迹" : model.selectedSessionTitle ?? "Pi")
+                    .appFont(.headline).lineLimit(1)
+                Image(systemName: "chevron.down").appFont(.caption2)
             }
             .foregroundStyle(.primary)
         }
@@ -204,7 +207,6 @@ struct ConversationScreen: View {
             .foregroundStyle(Theme.textSecondary)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .piGlassCard(radius: 14)
             .padding(.horizontal, 14)
             .padding(.bottom, 6)
         }
@@ -214,7 +216,7 @@ struct ConversationScreen: View {
         HStack(spacing: 8) {
             Image(systemName: icon)
             Text(text)
-                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             Spacer()
             Button(actionTitle) { action() }
                 .appFont(.caption.weight(.semibold))
@@ -223,7 +225,7 @@ struct ConversationScreen: View {
         .foregroundStyle(Theme.coral)
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
-        .piGlassCard(radius: 14, tint: Theme.coral.opacity(0.10))
+        .background(Color(uiColor: .secondarySystemBackground))
         .padding(.horizontal, 14)
         .padding(.bottom, 6)
     }
@@ -231,7 +233,8 @@ struct ConversationScreen: View {
     // MARK: - 内容
 
     private var content: some View {
-        VStack(spacing: 0) {
+        let timelineMessages = tab.messages(in: model.messages)
+        return VStack(spacing: 0) {
             if model.isLoadingHistory {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small).tint(Theme.ocean)
@@ -250,14 +253,14 @@ struct ConversationScreen: View {
             ) {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if tab == .chat {
-                        if model.messages.isEmpty, !model.isLoadingHistory {
+                        if timelineMessages.isEmpty, !model.isLoadingHistory, model.connection != .running {
                             if let error = model.errorMessage {
                                 ContentUnavailableView("会话暂不可用", systemImage: "exclamationmark.bubble", description: Text(error))
                             } else {
                                 EmptyConversationView()
                             }
                         } else {
-                            ForEach(model.messages) { message in
+                            ForEach(timelineMessages) { message in
                                 MessageBubble(message: message)
                                     .id(message.id)
                             }
@@ -267,6 +270,13 @@ struct ConversationScreen: View {
                                 model.answer(approval, confirmed: confirmed)
                             }
                             .reservedRegionAware()
+                        } else if !model.isLoadingHistory, ConversationTab.waitsForReply(in: model.messages, connection: model.connection) {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.mini).accessibilityHidden(true)
+                                Text("等待回复…").appFont(.footnote)
+                            }
+                            .foregroundStyle(.secondary)
+                            .accessibilityElement(children: .combine)
                         }
                     } else if timelineMessages.isEmpty, !model.isLoadingHistory {
                         Label("暂无工具调用轨迹", systemImage: "waveform.path.ecg")
@@ -274,7 +284,6 @@ struct ConversationScreen: View {
                             .foregroundStyle(Theme.textSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(16)
-                            .piGlassCard(radius: 18)
                     } else {
                         ForEach(timelineMessages) { message in
                             MessageBubble(message: message)
@@ -296,21 +305,17 @@ struct ConversationScreen: View {
         "\(model.selectedSessionPath ?? model.conversationID.uuidString):\(tab)"
     }
 
-    private var timelineMessages: [ChatMessage] {
-        tab == .chat ? model.messages : model.messages.filter { $0.toolTitle != nil }
-    }
-
     // MARK: - 输入区
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            TextField("描述你想要构建的内容", text: $model.draft, axis: .vertical)
+        VStack(alignment: .leading, spacing: 0) {
+            TextField("给 Pi 发消息", text: $model.draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .appFont(.body)
                 .foregroundStyle(.primary)
                 .focused($focused)
                 .lineLimit(1...5)
-                .frame(minHeight: 36, alignment: .topLeading)
+                .frame(minHeight: 32, alignment: .leading)
                 .accessibilityIdentifier("composer-input")
             HStack(spacing: 7) {
                 attachmentButton
@@ -334,28 +339,29 @@ struct ConversationScreen: View {
                     Image(systemName: showsStopButton ? "stop.fill" : "arrow.up")
                         .appFont(.system(size: showsStopButton ? 14 : 17, weight: .bold))
                         .foregroundStyle(.white)
-                        .frame(width: 42, height: 42)
-                        .background(Theme.ocean, in: Circle())
+                        .frame(width: 44, height: 44)
+                        .background(actionEnabled ? Theme.ocean : Color(uiColor: .systemGray), in: Circle())
                 }
                 .buttonStyle(bouncy())
                 .accessibilityLabel(showsStopButton ? "停止生成" : model.connection == .running ? "发送补充消息" : "发送消息")
                 .accessibilityIdentifier("composer-action")
-                .disabled(!showsStopButton && (model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.canSend))
+                .disabled(!actionEnabled)
             }
             .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 14)
         .padding(.top, 14)
-        .padding(.bottom, 12)
-        .piGlassCard(radius: 24)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 24).stroke(.primary.opacity(0.08), lineWidth: 0.7))
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.24 : 0.10), radius: 10, x: 0, y: 2)
+        .padding(.bottom, 4)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
         .frame(maxWidth: PiAdaptiveLayout.pageWidth)
         .frame(maxWidth: .infinity)
         .reservedRegionAware()
+    }
+
+    private var actionEnabled: Bool {
+        showsStopButton || (model.canSend && !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     private var showsStopButton: Bool {
@@ -412,25 +418,19 @@ struct ConversationScreen: View {
             }
         } label: {
             HStack(spacing: 5) {
-                Text(shortModelName).lineLimit(1).layoutPriority(-1)
-                Text(model.thinking.uppercased())
-                    .appFont(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Theme.purple)
-                    .padding(.horizontal, 5).padding(.vertical, 3)
-                    .background(Theme.purple.opacity(0.12), in: Capsule())
-                Image(systemName: "chevron.up.chevron.down").appFont(.system(size: 9, weight: .semibold))
+                Text(modelName).lineLimit(1).layoutPriority(-1)
+                Image(systemName: "chevron.down").appFont(.caption2)
             }
             .appFont(.caption.weight(.medium))
             .frame(minHeight: 44)
         }
-        .disabled(!model.canSend)
-        .accessibilityLabel("模型与思考强度，\(shortModelName)，\(model.thinking)")
+        .disabled(!model.canChangeSettings)
+        .accessibilityLabel("模型与思考强度，\(modelName)，\(model.thinking)")
     }
 
-    private var shortModelName: String {
-        let name = model.models.first(where: { $0.id == model.selectedModel })?.displayName
+    private var modelName: String {
+        model.models.first(where: { $0.id == model.selectedModel })?.displayName
             ?? (model.selectedModel.isEmpty ? "模型" : model.selectedModel)
-        return name.count > 18 ? String(name.prefix(18)) + "…" : name
     }
 }
 
@@ -438,7 +438,6 @@ struct ConversationScreen: View {
 
 private struct MessageBubble: View {
     let message: ChatMessage
-    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 7) {
@@ -449,8 +448,7 @@ private struct MessageBubble: View {
                     .appFont(.body)
                     .foregroundStyle(.primary)
                     .padding(10)
-                    .background(Theme.ocean.opacity(colorScheme == .dark ? 0.24 : 0.11), in: RoundedRectangle(cornerRadius: 15))
-                    .overlay(RoundedRectangle(cornerRadius: 15).stroke(Theme.ocean.opacity(colorScheme == .dark ? 0.34 : 0.08), lineWidth: 0.7))
+                    .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 15))
             case .assistant:
                 MarkdownLiteText(markdown: message.text, streaming: message.streaming)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -458,7 +456,7 @@ private struct MessageBubble: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label(message.toolTitle ?? "工具", systemImage: "wrench.and.screwdriver")
                         .appFont(.caption.weight(.semibold))
-                        .foregroundStyle(Theme.amber)
+                        .foregroundStyle(.secondary)
                     if !message.text.isEmpty {
                         Text(message.text)
                             .textSelection(.enabled)
@@ -472,11 +470,12 @@ private struct MessageBubble: View {
             }
             if !message.text.isEmpty {
                 PiCopyButton(text: message.text, title: "复制全文")
+                    .labelStyle(.iconOnly)
             }
         }
         .padding(.leading, message.role == .user ? 34 : 0)
         .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
-        .padding(.vertical, 12)
+        .padding(.vertical, 6)
     }
 }
 
@@ -503,27 +502,18 @@ private struct ApprovalCard: View {
             .appFont(.subheadline.weight(.semibold))
             .foregroundStyle(Theme.textPrimary)
             .padding(.vertical, 10)
-            .piGlassCard(radius: 14, tint: Theme.ocean.opacity(0.18))
+            .buttonStyle(.bordered)
         }
         .padding(14)
-        .piGlassCard(radius: 20, tint: Theme.amber.opacity(0.10))
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
 private struct EmptyConversationView: View {
     var body: some View {
-        VStack(spacing: 14) {
-            PiMark(size: 64)
-            Text("还没有消息")
-                .appFont(.headline)
-                .foregroundStyle(Theme.textPrimary)
-            Text("给 Pi 发条消息，开始这次会话。")
-                .appFont(.subheadline)
-                .foregroundStyle(Theme.textSecondary)
-        }
-        .frame(maxWidth: .infinity, minHeight: 260)
-        .padding(24)
-        .piGlassCard(radius: 24)
-        .padding(.top, 30)
+        Text("还没有消息")
+            .appFont(.body)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, minHeight: 160)
     }
 }

@@ -20,7 +20,7 @@ struct SessionsPane: View {
                     }
                     .axisBehavior(.verticalPreferred)
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button("设置", systemImage: "gearshape.fill", action: onSettings)
+                        Button("设置", systemImage: "gearshape", action: onSettings)
                             .labelStyle(.iconOnly)
                             .accessibilityIdentifier("workspace-settings")
                     }
@@ -49,20 +49,25 @@ struct SessionsPane: View {
                         Spacer()
                         if !usesVerticalToolbar {
                             connectionMenu
-                            PiIconButton(systemName: "gearshape.fill", action: onSettings)
+                            PiIconButton(systemName: "gearshape", action: onSettings)
                                 .accessibilityLabel("设置")
                                 .accessibilityIdentifier("workspace-settings")
                         }
                     }
-                    .padding(.bottom, columns ? 48 : 44)
+                    .padding(.bottom, 16)
                     if columns {
-                        HStack(alignment: .top, spacing: 36) {
-                            workspaceActions.frame(width: min(440, geometry.size.width * 0.38))
-                            sessions.frame(maxWidth: .infinity)
+                        HStack(alignment: .top, spacing: 28) {
+                            VStack(alignment: .leading, spacing: 12) {
+                                searchField
+                                actionButtons
+                            }
+                            .frame(width: min(260, geometry.size.width * 0.28), alignment: .leading)
+                            Divider()
+                            sessions(includesSearch: false).frame(maxWidth: .infinity)
                         }
                     } else {
                         workspaceActions
-                        sessions.padding(.top, 28)
+                        sessions(includesSearch: true).padding(.top, 16)
                     }
                 }
                 .padding(.horizontal, columns ? 40 : 22)
@@ -76,10 +81,6 @@ struct SessionsPane: View {
             .refreshable { model.loadSessions() }
         }
         .background(Theme.background())
-        // Whaleness's workspace keeps its deep-ocean appearance in light mode too.
-        .environment(\.colorScheme, .dark)
-        .foregroundStyle(.white)
-        .tint(.white)
     }
 
     private var connectionMenu: some View {
@@ -92,92 +93,48 @@ struct SessionsPane: View {
                 .appFont(.system(size: 17, weight: .semibold))
                 .frame(width: 44, height: 44)
         }
-        .buttonStyle(.glass)
-        .buttonBorderShape(.circle)
+        .buttonStyle(.plain)
         .accessibilityLabel("连接状态：\(statusText)")
     }
 
     private var workspaceActions: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 7) {
-                Text("探索未至之境").appFont(.system(size: 32, weight: .bold))
-                Text("Pi Mobile 预览版").appFont(.subheadline).foregroundStyle(.white.opacity(0.65))
-            }
-            HStack(spacing: 12) {
-                Image(systemName: "folder").appFont(.title3).foregroundStyle(Theme.mist)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("全部会话").appFont(.subheadline.weight(.semibold))
-                    Text("Mac · 端到端加密").appFont(.caption).foregroundStyle(.white.opacity(0.55))
-                }
-                Spacer()
-                Circle().fill(model.isConnected ? Theme.success : Theme.coral).frame(width: 8, height: 8)
-            }
-            .padding(16)
-            .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 15))
-            .overlay(RoundedRectangle(cornerRadius: 15).stroke(.white.opacity(0.14)))
-            Button {
-                searchIsFocused = false
-                model.newSession()
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "plus.circle.fill").appFont(.title3)
-                    Text("新建会话").appFont(.headline)
-                    Spacer()
-                    Image(systemName: "arrow.right").appFont(.subheadline)
-                }
-                .padding(18)
-                .piGlassCard(radius: 20, tint: Theme.ocean.opacity(0.24))
-            }
-            .disabled(!model.isConnected || model.isLoadingHistory)
-            .accessibilityIdentifier("workspace-new-session")
-            if model.selectedSessionPath != nil || model.selectedSessionTitle != nil || !model.messages.isEmpty || !model.draft.isEmpty {
-                Button {
-                    searchIsFocused = false
-                    model.focusComposer = false
-                    model.showConversation = true
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "bubble.left.and.bubble.right")
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("继续会话").appFont(.subheadline.weight(.semibold))
-                            Text(model.selectedSessionTitle ?? "当前会话")
-                                .appFont(.caption).foregroundStyle(.white.opacity(0.6)).lineLimit(1)
-                        }
-                        Spacer()
-                        Image(systemName: "arrow.right")
-                    }
-                    .padding(16)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 15))
-                }
-                .accessibilityIdentifier("workspace-continue-session")
-            }
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 20) { actionButtons }
+            VStack(alignment: .leading, spacing: 0) { actionButtons }
         }
     }
 
-    private var sessions: some View {
-        LazyVStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("最近会话").appFont(.headline)
-                Spacer()
-                Text(statusText).appFont(.caption).foregroundStyle(.white.opacity(0.6))
+    @ViewBuilder private var actionButtons: some View {
+        Button("新建会话", systemImage: "square.and.pencil") {
+            searchIsFocused = false
+            model.newSession()
+        }
+        .disabled(!model.isConnected || model.isLoadingHistory)
+        .accessibilityIdentifier("workspace-new-session")
+        .frame(minHeight: 44)
+        if model.selectedSessionPath != nil || model.selectedSessionTitle != nil || !model.messages.isEmpty || !model.draft.isEmpty {
+            Button("继续会话", systemImage: "arrow.turn.down.right") {
+                searchIsFocused = false
+                model.focusComposer = false
+                model.showConversation = true
             }
-            .padding(.bottom, 8)
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.68))
-                TextField("", text: $searchText, prompt: Text("搜索会话").foregroundColor(.white.opacity(0.58)))
-                    .appFont(.body)
-                    .focused($searchIsFocused)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.search)
-                    .onSubmit { searchIsFocused = false }
-            }
-            .padding(.horizontal, 12)
+            .accessibilityIdentifier("workspace-continue-session")
             .frame(minHeight: 44)
-            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 13))
-            .overlay(RoundedRectangle(cornerRadius: 13).stroke(.white.opacity(0.1)))
-            .padding(.bottom, 8)
+        }
+    }
+
+    private var searchField: some View {
+        PiSearchField(text: $searchText)
+            .focused($searchIsFocused)
+            .submitLabel(.search)
+            .onSubmit { searchIsFocused = false }
+    }
+
+    private func sessions(includesSearch: Bool) -> some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+            Text("最近会话").appFont(.title2.bold()).accessibilityAddTraits(.isHeader)
+                .padding(.bottom, 12)
+            if includesSearch { searchField }
             PiSessionList(searchText: searchText) { path in
                 searchIsFocused = false
                 model.switchSession(path)
@@ -211,8 +168,7 @@ struct PiSessionList: View {
                 .appFont(.subheadline)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(18)
-                .background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 15))
+                .padding(.vertical, 18)
         } else {
             ForEach(folders) { folder in
                 Section {
@@ -236,7 +192,9 @@ struct PiSessionList: View {
             .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.top, 8)
+        .foregroundStyle(.secondary)
+        .padding(.top, 22)
+        .padding(.bottom, 6)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isHeader)
     }
@@ -252,7 +210,7 @@ struct PiSessionList: View {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         if selected {
                             Image(systemName: "checkmark.circle.fill").appFont(.caption)
-                                .foregroundStyle(Theme.success).accessibilityHidden(true)
+                                .foregroundStyle(Theme.ocean).accessibilityHidden(true)
                         }
                         Text(entry.title).appFont(.body.weight(.medium)).lineLimit(largeType ? nil : 2)
                     }
@@ -266,14 +224,14 @@ struct PiSessionList: View {
                 }
             }
             .multilineTextAlignment(.leading)
-            .padding(16)
+            .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.primary.opacity(selected ? 0.09 : 0.045), in: RoundedRectangle(cornerRadius: 15))
-            .contentShape(RoundedRectangle(cornerRadius: 15))
+            .contentShape(Rectangle())
         }
         .buttonStyle(bouncy())
         .foregroundStyle(.primary)
         .accessibilityAddTraits(selected ? .isSelected : [])
+        .overlay(alignment: .bottom) { Divider().accessibilityHidden(true) }
     }
 }
 

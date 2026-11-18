@@ -510,6 +510,66 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertNotEqual(state.conversationID, oldID)
     }
 
+    func testLegacyPiSnapshotsAndDeltasProjectOnlyVisibleTextThroughHistory() throws {
+        var state = loadedState()
+        _ = state.preparePrompt(id: "p", text: "ask", connected: true)
+        let id = try XCTUnwrap(state.streamingID)
+        let hidden = ["type": "thinking", "thinking": "private thought", "thinkingSignature": "private signature"]
+        let literal = "  思考：<think>literal example</think>\n"
+        let thinking: [String: Any] = ["role": "assistant", "content": [hidden]]
+        state.applyEvent(["type": "message_update", "message": thinking, "assistantMessageEvent":
+            ["type": "thinking_delta", "delta": "private thought", "partial": thinking]])
+        XCTAssertEqual(state.messages.last?.text, "")
+        let snapshot: [String: Any] = ["role": "assistant", "content": [hidden, ["type": "text", "text": literal]]]
+        state.applyEvent(["type": "message_update", "assistantMessageEvent":
+            ["type": "text_delta", "contentIndex": 1, "delta": "example</think>\n", "partial": snapshot]])
+        XCTAssertEqual(state.messages.last?.text, literal)
+        state.applyEvent(["type": "message_end", "message": snapshot])
+        state.applyEvent(["type": "agent_end", "messages": [snapshot]])
+        state.applyEvent(["type": "agent_settled"])
+        state.beginHistory(id: "h", path: "/a")
+        _ = state.receiveHistory(id: "h", path: "/a", items: [item("a", "user", "A"), item("q", "user", "ask"), item("r", "assistant", literal)])
+        XCTAssertEqual(state.messages.map(\.text), ["A", "ask", literal])
+        XCTAssertEqual(state.messages.last?.id, id)
+    }
+
+    func testSettlingWithoutMessageEndKeepsPartialAfterIdleHistory() throws {
+        var state = loadedState()
+        _ = state.preparePrompt(id: "p", text: "ask", connected: true)
+        _ = state.resolvePrompt(id: "p", success: true)
+        state.applyEvent(textDelta("partial"))
+        let id = try XCTUnwrap(state.streamingID)
+        state.disconnected()
+        state.beginStateRequest(id: "state")
+        _ = state.receiveState(id: "state", path: "/a", running: false)
+        state.beginHistory(id: "h", path: "/a")
+        _ = state.receiveHistory(id: "h", path: "/a", items: [item("a", "user", "A"), item("q", "user", "ask")])
+        XCTAssertEqual(state.messages.last?.id, id)
+        XCTAssertEqual(state.messages.last?.text, "partial")
+        state.beginHistory(id: "final", path: "/a")
+        _ = state.receiveHistory(id: "final", path: "/a", items: [item("a", "user", "A"), item("q", "user", "ask"), item("r", "assistant", "partial continued")])
+        XCTAssertEqual(state.messages.last?.id, id)
+        XCTAssertEqual(state.messages.map(\.text), ["A", "ask", "partial continued"])
+    }
+
+    func testEmptyFinalRetainsVisiblePartialAcrossSameBranchRefresh() throws {
+        var state = loadedState()
+        _ = state.preparePrompt(id: "p", text: "ask", connected: true)
+        _ = state.resolvePrompt(id: "p", success: true)
+        state.applyEvent(textDelta("interrupted"))
+        let id = try XCTUnwrap(state.streamingID)
+        state.applyEvent(["type": "message_end", "message": ["role": "assistant", "content": [], "stopReason": "aborted"]])
+        state.applyEvent(["type": "agent_settled"])
+        XCTAssertEqual(state.messages.last?.text, "interrupted")
+        state.beginHistory(id: "h", path: "/a")
+        _ = state.receiveHistory(id: "h", path: "/a", items: [item("a", "user", "A"), item("q", "user", "ask")])
+        XCTAssertEqual(state.messages.last?.text, "interrupted")
+        XCTAssertEqual(state.messages.last?.id, id)
+        state.beginHistory(id: "branch", path: "/a")
+        _ = state.receiveHistory(id: "branch", path: "/a", items: [item("other", "user", "B")])
+        XCTAssertEqual(state.messages.map(\.text), ["B"])
+    }
+
     private func loadedState() -> ConversationState {
         var state = ConversationState()
         state.beginHistory(id: "initial", path: "/a")

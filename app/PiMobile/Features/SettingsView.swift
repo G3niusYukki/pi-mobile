@@ -42,21 +42,7 @@ struct PiSettingsView: View {
             Section {
                 SettingsNavigationButton(title: "模型", value: currentModelName) { open(.model) }
                     .accessibilityIdentifier("settings-model")
-                SettingsChoiceMenu(title: "思考强度", value: PiThinkingLevel.title(model.thinking)) {
-                    ForEach(PiThinkingLevel.choices, id: \.self) { level in
-                        Button {
-                            model.setThinking(level)
-                        } label: {
-                            if model.thinking == level {
-                                Label(PiThinkingLevel.title(level), systemImage: "checkmark")
-                            } else {
-                                Text(PiThinkingLevel.title(level))
-                            }
-                        }
-                    }
-                }
-                .disabled(!model.canSend)
-                .accessibilityIdentifier("settings-thinking")
+                ThinkingLevelMenu()
             } header: {
                 Text("当前会话").appFont(SettingsTypography.section)
             } footer: {
@@ -117,6 +103,7 @@ struct PiSettingsView: View {
             }
         }
         .appFont(SettingsTypography.item)
+        .safeAreaInset(edge: .bottom, spacing: 0) { SettingsFeedback() }
         .navigationTitle("设置")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("清除本机配对并重新扫码？", isPresented: $showsPairingReset, titleVisibility: .visible) {
@@ -195,7 +182,7 @@ private struct SettingsNavigationButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(Text(title) + Text("，") + Text(verbatim: value))
+        .accessibilityLabel(Text("\(Text(title))，\(value)"))
     }
 }
 
@@ -225,7 +212,7 @@ private struct SettingsChoiceMenu<Content: View>: View {
             }
             .buttonStyle(.borderless)
             .tint(.primary)
-            .accessibilityLabel(Text(title) + Text("，") + Text(verbatim: value))
+            .accessibilityLabel(Text("\(Text(title))，\(value)"))
         }
     }
 }
@@ -362,200 +349,87 @@ private struct PiFontSizeSettingsView: View {
     }
 }
 
+private struct SettingsFeedback: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        if let error = model.settingError {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.circle").accessibilityHidden(true)
+                Text(verbatim: error).frame(maxWidth: .infinity, alignment: .leading)
+                Button("关闭", systemImage: "xmark", action: model.dismissSettingError)
+                    .labelStyle(.iconOnly).frame(minWidth: 44, minHeight: 44)
+            }
+            .appFont(.footnote)
+            .padding(.horizontal, 16)
+            .background(.bar)
+            .accessibilityIdentifier("settings-feedback")
+        }
+    }
+}
+
+private struct ThinkingLevelMenu: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        SettingsChoiceMenu(title: "思考强度", value: PiThinkingLevel.title(model.thinking)) {
+            ForEach(PiThinkingLevel.choices, id: \.self) { level in
+                Button { model.setThinking(level) } label: {
+                    if model.thinking == level { Label(PiThinkingLevel.title(level), systemImage: "checkmark") }
+                    else { Text(PiThinkingLevel.title(level)) }
+                }
+            }
+        }
+        .disabled(!model.canChangeSettings)
+        .accessibilityIdentifier("settings-thinking")
+    }
+}
+
 private struct PiModelSelectionView: View {
     @EnvironmentObject private var model: AppModel
 
     private var providers: [String] {
-        Array(Set(model.models.map(\.provider))).sorted {
-            $0.localizedStandardCompare($1) == .orderedAscending
-        }
+        Array(Set(model.models.map(\.provider))).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("当前会话模型").appFont(SettingsTypography.title)
-                    Text("选择当前 Pi 会话使用的模型，并调整思考强度。")
-                        .appFont(SettingsTypography.description)
+        Form {
+            Section { ThinkingLevelMenu() }
+            if model.models.isEmpty {
+                Section {
+                    Text(model.isConnected ? "暂无可用模型" : "连接到 Mac 后可查看模型")
                         .foregroundStyle(.secondary)
+                    Button("重新连接") { model.reconnect() }
+                        .disabled(!model.isPaired || model.connection == .connecting)
                 }
-
-                if model.models.isEmpty {
-                    emptyModels
-                } else {
-                    ForEach(providers, id: \.self) { provider in
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(verbatim: provider)
-                                .appFont(SettingsTypography.section)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 4)
-                            ForEach(model.models.filter { $0.provider == provider }) { option in
-                                PiModelCard(
-                                    option: option,
-                                    isSelected: model.selectedModel == option.id,
-                                    thinking: model.thinking,
-                                    select: { model.chooseModel(option) },
-                                    setThinking: model.setThinking
-                                )
-                                .disabled(!model.canSend)
-                                .opacity(!model.isConnected || model.isLoadingHistory ? 0.7 : 1)
+            }
+            ForEach(providers, id: \.self) { provider in
+                Section {
+                    ForEach(model.models.filter { $0.provider == provider }) { option in
+                        let selected = model.selectedModel == option.id
+                        Button { model.chooseModel(option) } label: {
+                            HStack(spacing: 12) {
+                                Text(verbatim: option.displayName).foregroundStyle(.primary)
+                                Spacer(minLength: 8)
+                                Image(systemName: "checkmark")
+                                    .fontWeight(.semibold)
+                                    .foregroundStyle(.tint)
+                                    .opacity(selected ? 1 : 0)
+                                    .accessibilityHidden(true)
                             }
+                            .frame(minHeight: 30)
+                            .contentShape(Rectangle())
                         }
+                        .disabled(!model.canChangeSettings)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .accessibilityIdentifier("model-option-\(option.id)")
                     }
-                }
+                } header: { Text(verbatim: provider).textCase(nil) }
             }
-            .frame(maxWidth: 1040, alignment: .leading)
-            .padding(20)
-            .frame(maxWidth: .infinity)
         }
-        .background(Color(uiColor: .systemGroupedBackground))
-        .navigationTitle("当前会话模型")
+        .appFont(SettingsTypography.item)
+        .safeAreaInset(edge: .bottom, spacing: 0) { SettingsFeedback() }
+        .navigationTitle("模型")
         .navigationBarTitleDisplayMode(.inline)
-    }
-
-    private var emptyModels: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(model.connection == .connecting ? "正在连接 Mac…" : "暂无可用模型")
-                .appFont(SettingsTypography.item)
-            Text(model.isConnected ? "Pi 尚未返回可用模型。可以重新连接以再次读取。" : "连接到 Mac 后，会在这里显示 Pi 的可用模型。")
-                .appFont(SettingsTypography.description)
-                .foregroundStyle(.secondary)
-            Button("重新连接") { model.reconnect() }
-                .appFont(SettingsTypography.item)
-                .disabled(!model.isPaired || model.connection == .connecting)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
-    }
-}
-
-private struct PiModelCard: View {
-    let option: ModelOption
-    let isSelected: Bool
-    let thinking: String
-    let select: () -> Void
-    let setThinking: (String) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button {
-                if !isSelected { select() }
-            } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(verbatim: option.displayName)
-                        .appFont(SettingsTypography.item)
-                        .foregroundStyle(.primary)
-                        .multilineTextAlignment(.leading)
-                    Spacer()
-                    if isSelected {
-                        Text("当前使用")
-                            .appFont(SettingsTypography.description.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .fixedSize()
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(.black, in: Capsule())
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(isSelected ? "已选中" : "未选中")
-            .accessibilityAddTraits(isSelected ? .isSelected : [])
-
-            if isSelected {
-                ReasoningEffortFlowLayout(spacing: 8) {
-                    Text(PiThinkingLevel.choices.contains(thinking) ? "思考强度" : "思考强度 · \(PiThinkingLevel.title(thinking))")
-                        .appFont(SettingsTypography.item)
-                        .foregroundStyle(.secondary)
-                        .fixedSize()
-                    ForEach(PiThinkingLevel.choices, id: \.self) { level in
-                        Button { setThinking(level) } label: {
-                            Text(PiThinkingLevel.title(level))
-                                .appFont(SettingsTypography.item)
-                                .fixedSize()
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(thinking == level ? Color.primary : Color.secondary.opacity(0.12), in: Capsule())
-                                .foregroundStyle(thinking == level ? Color(uiColor: .systemBackground) : .primary)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("思考强度，\(PiThinkingLevel.title(level))")
-                        .accessibilityAddTraits(thinking == level ? .isSelected : [])
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(Color(uiColor: .secondarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(isSelected ? Color.primary : Color.secondary.opacity(0.18), lineWidth: isSelected ? 1.5 : 1)
-        }
-    }
-}
-
-/// Capsules keep their natural size and wrap at card width, including in Dynamic Type.
-private struct ReasoningEffortFlowLayout: Layout {
-    var spacing: CGFloat = 8
-
-    private struct Item {
-        let index: Int
-        let size: CGSize
-    }
-
-    private struct Row {
-        var items: [Item] = []
-        var width: CGFloat = 0
-        var height: CGFloat = 0
-    }
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let rows = makeRows(width: proposal.width ?? .infinity, subviews: subviews)
-        return CGSize(
-            width: rows.map(\.width).max() ?? 0,
-            height: rows.reduce(0) { $0 + $1.height } + CGFloat(max(0, rows.count - 1)) * spacing
-        )
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let rows = makeRows(width: bounds.width, subviews: subviews)
-        var y = bounds.minY
-        for row in rows {
-            var x = bounds.minX
-            for item in row.items {
-                subviews[item.index].place(
-                    at: CGPoint(x: x, y: y + (row.height - item.size.height) / 2),
-                    anchor: .topLeading,
-                    proposal: ProposedViewSize(item.size)
-                )
-                x += item.size.width + spacing
-            }
-            y += row.height + spacing
-        }
-    }
-
-    private func makeRows(width: CGFloat, subviews: Subviews) -> [Row] {
-        var rows: [Row] = []
-        var row = Row()
-        for (index, subview) in subviews.enumerated() {
-            let size = subview.sizeThatFits(.unspecified)
-            let gap: CGFloat = row.items.isEmpty ? 0 : spacing
-            if !row.items.isEmpty, row.width + gap + size.width > width {
-                rows.append(row)
-                row = Row()
-            }
-            row.width += (row.items.isEmpty ? 0 : spacing) + size.width
-            row.height = max(row.height, size.height)
-            row.items.append(Item(index: index, size: size))
-        }
-        if !row.items.isEmpty { rows.append(row) }
-        return rows
     }
 }

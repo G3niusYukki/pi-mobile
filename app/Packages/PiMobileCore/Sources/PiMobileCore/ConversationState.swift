@@ -36,6 +36,7 @@ public struct ConversationState {
     private var stateRevision = 0
     private var prompts: [String: Prompt] = [:]
     private var toolMessageIDs: [String: UUID] = [:]
+    private var interruptedIDs = Set<UUID>()
     private var revision = 0
 
     public init() {}
@@ -153,7 +154,8 @@ public struct ConversationState {
         let changed = sessionPath != request.path
         let previous = changed ? [] : messages
         let preserveTail = !changed && (isRunning || revision != request.revision || !prompts.isEmpty)
-        messages = Self.mergeHistory(items, path: request.path, previous: previous, preserveTail: preserveTail, hasEarlierMessages: hasEarlierMessages)
+        messages = Self.mergeHistory(items, path: request.path, previous: previous, interruptedIDs: interruptedIDs, preserveTail: preserveTail, hasEarlierMessages: hasEarlierMessages)
+        interruptedIDs.formIntersection(messages.filter { $0.sourceID == nil }.map(\.id))
         if changed {
             // Binding the first discovered path does not reset a new conversation.
             if sessionPath != nil || !isSessionReady { conversationID = UUID() }
@@ -256,20 +258,19 @@ public struct ConversationState {
         case "agent_start", "turn_start":
             isRunning = true
         case "message_update":
-            let delta = PiProjection.delta(from: event)
-            if let text = delta.text { appendStreaming(text) }
-            // The execution lifecycle owns tool cards; toolcall_start is only
-            // argument generation and would create a duplicate empty card.
+            guard let update = event["assistantMessageEvent"] as? [String: Any],
+                  let type = update["type"] as? String,
+                  ["text_start", "text_delta", "text_end"].contains(type) else { return nil }
+            let snapshot = (event["message"] ?? update["partial"]) as? [String: Any]
+            let visible = PiProjection.text(fromContent: snapshot?["content"])
+            if !visible.isEmpty { updateStreaming(visible, replace: true) }
+            else if let delta = PiProjection.delta(from: event).text, !delta.isEmpty { updateStreaming(delta) }
+            // Tool execution events own their cards; argument generation has no transcript row.
         case "message_end":
             guard let message = event["message"] as? [String: Any], message["role"] as? String == "assistant" else { return nil }
             let final = PiProjection.text(fromContent: message["content"])
-            if let index = messages.firstIndex(where: { $0.id == streamingID }) {
-                messages[index].text = final
-                messages[index].streaming = false
-            } else if !final.isEmpty {
-                messages.append(ChatMessage(role: .assistant, text: final))
-            }
-            streamingID = nil
+            if !final.isEmpty { updateStreaming(final, replace: true) }
+            finishStreaming(hasVisibleFinal: !final.isEmpty)
         case "tool_execution_start", "tool_execution_update", "tool_execution_end":
             guard let callID = event["toolCallId"] as? String else { return nil }
             let result = (event["result"] ?? event["partialResult"]) as? [String: Any]
@@ -293,9 +294,10 @@ public struct ConversationState {
         return nil
     }
 
-    private mutating func appendStreaming(_ text: String) {
+    private mutating func updateStreaming(_ text: String, replace: Bool = false) {
         if let index = messages.firstIndex(where: { $0.id == streamingID }) {
-            messages[index].text += text
+            if replace { messages[index].text = text }
+            else { messages[index].text += text }
         } else {
             let message = ChatMessage(role: .assistant, text: text, streaming: true)
             messages.append(message)
@@ -304,15 +306,18 @@ public struct ConversationState {
         isRunning = true
     }
 
-    private mutating func finishStreaming() {
+    private mutating func finishStreaming(hasVisibleFinal: Bool = false) {
         if let index = messages.firstIndex(where: { $0.id == streamingID }) {
             if messages[index].text.isEmpty { messages.remove(at: index) }
-            else { messages[index].streaming = false }
+            else {
+                messages[index].streaming = false
+                if !hasVisibleFinal { interruptedIDs.insert(messages[index].id) }
+            }
         }
         streamingID = nil
     }
 
-    private static func mergeHistory(_ items: [[String: Any]], path: String, previous: [ChatMessage], preserveTail: Bool, hasEarlierMessages: Bool) -> [ChatMessage] {
+    private static func mergeHistory(_ items: [[String: Any]], path: String, previous: [ChatMessage], interruptedIDs: Set<UUID>, preserveTail: Bool, hasEarlierMessages: Bool) -> [ChatMessage] {
         var consumed = Set<UUID>()
         var merged: [ChatMessage] = []
         for (offset, item) in items.enumerated() {
@@ -329,7 +334,8 @@ public struct ConversationState {
                 ?? available.first { old in
                     guard old.sourceID == nil, old.role == role, old.toolTitle == tool,
                           callID == nil || old.toolCallID == nil || old.toolCallID == callID else { return false }
-                    return old.text == text || (old.streaming && !old.text.isEmpty && (text.hasPrefix(old.text) || old.text.hasPrefix(text)))
+                    let partial = old.streaming || interruptedIDs.contains(old.id)
+                    return old.text == text || (partial && !old.text.isEmpty && (text.hasPrefix(old.text) || old.text.hasPrefix(text)))
                 }
             if var message = match {
                 consumed.insert(message.id)
@@ -349,6 +355,14 @@ public struct ConversationState {
             let prefix = previous[..<boundary].filter { $0.sourceID != nil && !consumed.contains($0.id) }
             consumed.formUnion(prefix.map(\.id))
             merged.insert(contentsOf: prefix, at: 0)
+        }
+        // Pi omits empty finals from history. Keep a locally observed answer with its
+        // original ID while the preceding row still belongs to this branch.
+        for (offset, message) in previous.enumerated() where interruptedIDs.contains(message.id) && !consumed.contains(message.id) {
+            guard offset > 0, let anchor = merged.firstIndex(where: { $0.id == previous[offset - 1].id }),
+                  anchor + 1 == merged.count || merged[anchor + 1].role != .assistant else { continue }
+            merged.insert(message, at: anchor + 1)
+            consumed.insert(message.id)
         }
         if preserveTail {
             merged.append(contentsOf: previous.filter { !consumed.contains($0.id) && ($0.sourceID == nil || $0.streaming) })

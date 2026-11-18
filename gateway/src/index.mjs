@@ -51,24 +51,61 @@ let stdoutBuffer = Buffer.alloc(0)
 let shuttingDown = false
 let serial = 0
 const nativeRequests = new Map()
-const pendingSessionChanges = new Set()
+const pendingStateChanges = new Set()
 
 function toRelay(obj) {
   if (relay?.readyState === WebSocket.OPEN) relay.send(JSON.stringify(obj))
+}
+// Pi repeats the whole assistant message in partials, finals and run summaries.
+// Project protocol fields at the phone boundary; literal markup inside text is ordinary text.
+function phoneContent(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return []
+  return content.filter(block => block?.type === "text" && typeof block.text === "string").map(({ text }) => ({ type: "text", text }))
+}
+function phoneMessage(message) {
+  if (!message) return undefined
+  const { role, toolCallId, toolName } = message
+  return { role, toolCallId, toolName, content: phoneContent(message.content) }
+}
+function phoneEvent(event) {
+  const { type, sessionPath } = event
+  if (type === "message_update") {
+    const update = event.assistantMessageEvent
+    if (!["text_start", "text_delta", "text_end"].includes(update?.type)) return null
+    return { type, sessionPath, message: phoneMessage(event.message ?? update.partial),
+      assistantMessageEvent: { type: update.type, delta: update.type === "text_delta" ? update.delta : undefined } }
+  }
+  if (type === "message_start" || type === "message_end") return { type, sessionPath, message: phoneMessage(event.message) }
+  // These lifecycle signals need no copy of the transcript on the phone.
+  if (["turn_start", "turn_end", "agent_start", "agent_end", "agent_settled"].includes(type)) return { type, sessionPath }
+  if (type === "extension_ui_request") return event
+  if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(type)) {
+    const { toolCallId, toolName, isError, partialResult, result } = event
+    return { type, sessionPath, toolCallId, toolName, isError,
+      partialResult: partialResult && { content: phoneContent(partialResult.content) },
+      result: result && { content: phoneContent(result.content) } }
+  }
+  // Session-internal events (including entry_appended) can carry entire raw records.
+  return null
 }
 function respond(record) {
   const tracked = nativeRequests.get(record.id)
   const request = tracked?.type === record.command ? tracked : undefined
   let data = record.data
+  if (record.command === "get_messages" && Array.isArray(data?.messages)) {
+    data = { ...data, messages: data.messages.map(phoneMessage) }
+  }
   if (request) {
     nativeRequests.delete(record.id)
     if (request.done) {
-      pendingSessionChanges.delete(request.done)
+      pendingStateChanges.delete(request.done)
       request.resolve()
     }
     if (request.type === "get_state" && record.success === true && data && typeof data === "object") {
       data = { ...data, sessionBarrier: true }
       if (typeof request.afterSessionChangeId === "string") data.sessionBarrierId = request.afterSessionChangeId
+      if (typeof request.afterSettingChangeId === "string") data.settingBarrierId = request.afterSettingChangeId
     }
   }
   const sealed = seal({ id: request ? request.id : record.id ?? null, success: record.success, data, error: record.error })
@@ -80,20 +117,20 @@ function failNativeRequests(error) {
   }
 }
 function forwardToPi(obj) {
-  const isSessionChange = obj?.type === "switch_session" || obj?.type === "new_session"
-  if (!isSessionChange && obj?.type !== "get_state") {
+  const isStateChange = ["switch_session", "new_session", "set_model", "set_thinking_level"].includes(obj?.type)
+  if (!isStateChange && obj?.type !== "get_state") {
     if (child?.stdin?.writable) child.stdin.write(`${JSON.stringify(obj)}\n`)
     return
   }
   // 独立的原生 ID 避免客户端 ID 缺失/复用误解锁屏障；响应还原客户端 ID。
   const id = `gateway-native-${++serial}`
-  const { afterSessionChangeId, ...command } = obj
-  const request = { id: obj.id ?? null, type: obj.type, afterSessionChangeId }
-  if (isSessionChange) {
+  const { afterSessionChangeId, afterSettingChangeId, ...command } = obj
+  const request = { id: obj.id ?? null, type: obj.type, afterSessionChangeId, afterSettingChangeId }
+  if (isStateChange) {
     request.done = new Promise((resolve) => { request.resolve = resolve })
-    pendingSessionChanges.add(request.done)
+    pendingStateChanges.add(request.done)
   }
-  // 必须在写 stdin 前同步登记，后续 get_state 才能看到所有已接收的会话变更。
+  // 必须在写 stdin 前同步登记，后续 get_state 才能看到所有已接收的会话和设置变更。
   nativeRequests.set(id, request)
   if (!child?.stdin?.writable || child.exitCode !== null || child.signalCode !== null) {
     respond({ type: "response", id, command: obj.type, success: false, error: "Pi process is not available" })
@@ -105,13 +142,13 @@ function forwardToPi(obj) {
     }
   })
 }
-async function stateAfterSessionChanges(command) {
+async function stateAfterChanges(command) {
   // Pi 会并发处理 JSONL 命令；仅状态查询等待，扩展 UI 回复仍可解除原生 hook。
-  while (pendingSessionChanges.size) await Promise.all([...pendingSessionChanges])
+  while (pendingStateChanges.size) await Promise.all([...pendingStateChanges])
   forwardToPi(command)
 }
 function toPi(obj) {
-  if (obj?.type === "get_state") void stateAfterSessionChanges(obj)
+  if (obj?.type === "get_state") void stateAfterChanges(obj)
   else forwardToPi(obj)
 }
 
@@ -150,7 +187,9 @@ function startPi() {
       if (record.type === "response") {
         respond(record)
       } else {
-        const sealed = seal(record)
+        const event = phoneEvent(record)
+        if (!event) continue
+        const sealed = seal(event)
         toRelay({ type: "event", sealed })
       }
     }
