@@ -1,6 +1,6 @@
 {
   "name": "pi-mobile-relay",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Pi Mobile 中转：只做鉴权、配对与消息路由，不存会话内容",

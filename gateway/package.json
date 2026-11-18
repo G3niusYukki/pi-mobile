@@ -1,6 +1,6 @@
 {
   "name": "pi-mobile-gateway",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Mac 端网关：spawn pi --mode rpc，把 JSONL 接到 Pi Mobile relay",
