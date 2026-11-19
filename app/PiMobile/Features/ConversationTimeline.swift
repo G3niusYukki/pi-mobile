@@ -22,6 +22,7 @@ struct ConversationTimeline<Content: View>: View {
     let storageKey: String
     let messageIDs: [UUID]
     let isLoading: Bool
+    var isRunning: Bool = false
     var submittedPromptID: String? = nil
     @ViewBuilder var content: () -> Content
 
@@ -35,6 +36,10 @@ struct ConversationTimeline<Content: View>: View {
     @State private var ready = false
     @State private var needsRestore = true
 
+    private var showsScrollToBottom: Bool {
+        ready && !viewport.followsLatest && !messageIDs.isEmpty
+    }
+
     var body: some View {
         ScrollView {
             content()
@@ -42,6 +47,7 @@ struct ConversationTimeline<Content: View>: View {
         }
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
+        .scrollEdgeEffectStyle(.soft, for: .bottom)
         .scrollPosition($position)
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .onScrollGeometryChange(for: TimelineGeometry.self) { geometry in
@@ -64,7 +70,7 @@ struct ConversationTimeline<Content: View>: View {
                 viewport.followsLatest = new.distanceToBottom < 60
                 store.save(viewport, for: storageKey)
             } else if viewport.followsLatest,
-                      old.height != new.height || old.viewportHeight != new.viewportHeight {
+                      old.height != new.height || old.viewportHeight != new.viewportHeight || old.bottomInset != new.bottomInset {
                 position.scrollTo(edge: .bottom)
             } else if !isLoading {
                 // Keep the offset produced by an anchor restore, even when a nonanimated
@@ -114,27 +120,40 @@ struct ConversationTimeline<Content: View>: View {
             if let geometry { restore(in: geometry) }
         }
         .overlay(alignment: .bottomTrailing) {
-            if ready, !viewport.followsLatest, !messageIDs.isEmpty {
-                Button {
-                    followLatest(animated: true)
-                } label: {
-                    Label("回到最新", systemImage: "arrow.down")
-                        .font(.caption.weight(.semibold))
+            Group {
+                if showsScrollToBottom {
+                    Button {
+                        PiHaptics.tap()
+                        followLatest(animated: true)
+                    } label: {
+                        HStack(spacing: 6) {
+                            if isRunning {
+                                StatusDot(color: Theme.ocean, size: 6, pulsing: true)
+                            }
+                            Image(systemName: "arrow.down")
+                                .appFont(.caption.weight(.bold))
+                            Text(isRunning ? "实时输出" : "回到最新")
+                                .appFont(.caption.weight(.semibold))
+                        }
                         .foregroundStyle(Theme.textPrimary)
                         .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-                        .piGlassCard(radius: 22, tint: Theme.ocean.opacity(0.22))
+                        .padding(.vertical, 10)
+                        .piGlassCard(radius: 22, tint: Theme.ocean.opacity(0.20), interactive: true)
+                    }
+                    .buttonStyle(bouncy())
+                    .padding(16)
+                    .transition(PiMotion.floatingPillTransition)
                 }
-                .buttonStyle(bouncy())
-                .padding(16)
             }
+            .animation(PiMotion.snappy(reduceMotion), value: showsScrollToBottom)
+            .animation(PiMotion.quickFade(reduceMotion), value: isRunning)
         }
     }
 
     private func followLatest(animated: Bool) {
         viewport.followsLatest = true
         store.save(viewport, for: storageKey)
-        withAnimation(animated && !reduceMotion ? .easeOut(duration: 0.2) : nil) {
+        withAnimation(animated ? PiMotion.smooth(reduceMotion) : nil) {
             position.scrollTo(edge: .bottom)
         }
     }

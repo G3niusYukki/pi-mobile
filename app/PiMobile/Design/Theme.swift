@@ -48,22 +48,11 @@ struct GlassSurface: ViewModifier {
     let radius: CGFloat
     let tint: Color?
     let clear: Bool
+    let interactive: Bool
 
     func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {
-            if clear {
-                if let tint {
-                    content.glassEffect(.clear.tint(tint), in: .rect(cornerRadius: radius))
-                } else {
-                    content.glassEffect(.clear, in: .rect(cornerRadius: radius))
-                }
-            } else {
-                if let tint {
-                    content.glassEffect(.regular.tint(tint), in: .rect(cornerRadius: radius))
-                } else {
-                    content.glassEffect(.regular, in: .rect(cornerRadius: radius))
-                }
-            }
+            content.glassEffect(resolvedGlass, in: .rect(cornerRadius: radius))
         } else {
             content
                 .background(
@@ -80,11 +69,19 @@ struct GlassSurface: ViewModifier {
                 )
         }
     }
+
+    @available(iOS 26.0, *)
+    private var resolvedGlass: Glass {
+        var glass: Glass = clear ? .clear : .regular
+        if let tint { glass = glass.tint(tint) }
+        if interactive { glass = glass.interactive() }
+        return glass
+    }
 }
 
 extension View {
-    func piGlassCard(radius: CGFloat = 20, tint: Color? = nil, clear: Bool = false) -> some View {
-        modifier(GlassSurface(radius: radius, tint: tint, clear: clear))
+    func piGlassCard(radius: CGFloat = 20, tint: Color? = nil, clear: Bool = false, interactive: Bool = false) -> some View {
+        modifier(GlassSurface(radius: radius, tint: tint, clear: clear, interactive: interactive))
     }
 }
 
@@ -233,28 +230,35 @@ struct PiSearchField: View {
 
 // MARK: - 旧组件兼容层（Markdown / 主题仍会用到）
 
-/// 状态点（带呼吸光晕）
+/// 状态点（带呼吸光晕，尊重 Reduce Motion 且支持动态切换）
 struct StatusDot: View {
     var color: Color
+    var size: CGFloat = 8
     var pulsing: Bool = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var phase: CGFloat = 0
 
     var body: some View {
         Circle()
             .fill(color)
-            .frame(width: 8, height: 8)
+            .frame(width: size, height: size)
             .overlay(
                 Circle()
-                    .stroke(color.opacity(0.5), lineWidth: 1)
-                    .scaleEffect(1 + phase * 2.2)
-                    .opacity(pulsing ? 1 - phase : 0)
+                    .stroke(color.opacity(0.55), lineWidth: 1.2)
+                    .scaleEffect(1 + phase * 2.1)
+                    .opacity(pulsing && !reduceMotion ? 1 - phase : 0)
             )
-            .onAppear {
-                guard pulsing else { return }
-                withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) {
-                    phase = 1
-                }
-            }
+            .onAppear { syncPulse() }
+            .onChange(of: pulsing) { _, _ in syncPulse() }
+            .onChange(of: reduceMotion) { _, _ in syncPulse() }
+    }
+
+    private func syncPulse() {
+        phase = 0
+        guard pulsing, !reduceMotion else { return }
+        withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) {
+            phase = 1
+        }
     }
 }
 

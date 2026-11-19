@@ -69,6 +69,7 @@ struct PiSettingsView: View {
                 SettingsChoiceMenu(title: "外观", value: interfaceStyle.title) {
                     ForEach(PiInterfaceStyle.allCases) { style in
                         Button {
+                            PiHaptics.selection()
                             interfaceStyle = style
                         } label: {
                             if interfaceStyle == style {
@@ -351,20 +352,28 @@ private struct PiFontSizeSettingsView: View {
 
 private struct SettingsFeedback: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        if let error = model.settingError {
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.circle").accessibilityHidden(true)
-                Text(verbatim: error).frame(maxWidth: .infinity, alignment: .leading)
-                Button("关闭", systemImage: "xmark", action: model.dismissSettingError)
+        Group {
+            if let error = model.settingError {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.circle").accessibilityHidden(true)
+                    Text(verbatim: error).frame(maxWidth: .infinity, alignment: .leading)
+                    Button("关闭", systemImage: "xmark") {
+                        PiHaptics.tap()
+                        model.dismissSettingError()
+                    }
                     .labelStyle(.iconOnly).frame(minWidth: 44, minHeight: 44)
+                }
+                .appFont(.footnote)
+                .padding(.horizontal, 16)
+                .background(.bar)
+                .accessibilityIdentifier("settings-feedback")
+                .transition(PiMotion.floatingPillTransition)
             }
-            .appFont(.footnote)
-            .padding(.horizontal, 16)
-            .background(.bar)
-            .accessibilityIdentifier("settings-feedback")
         }
+        .animation(PiMotion.smooth(reduceMotion), value: model.settingError)
     }
 }
 
@@ -374,7 +383,10 @@ private struct ThinkingLevelMenu: View {
     var body: some View {
         SettingsChoiceMenu(title: "思考强度", value: PiThinkingLevel.title(model.thinking)) {
             ForEach(PiThinkingLevel.choices, id: \.self) { level in
-                Button { model.setThinking(level) } label: {
+                Button {
+                    PiHaptics.selection()
+                    model.setThinking(level)
+                } label: {
                     if model.thinking == level { Label(PiThinkingLevel.title(level), systemImage: "checkmark") }
                     else { Text(PiThinkingLevel.title(level)) }
                 }
@@ -387,6 +399,7 @@ private struct ThinkingLevelMenu: View {
 
 private struct PiModelSelectionView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var providers: [String] {
         Array(Set(model.models.map(\.provider))).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
@@ -407,16 +420,21 @@ private struct PiModelSelectionView: View {
                 Section {
                     ForEach(model.models.filter { $0.provider == provider }) { option in
                         let selected = model.selectedModel == option.id
-                        Button { model.chooseModel(option) } label: {
+                        Button {
+                            PiHaptics.selection()
+                            model.chooseModel(option)
+                        } label: {
                             HStack(spacing: 12) {
                                 Text(verbatim: option.displayName).foregroundStyle(.primary)
                                 Spacer(minLength: 8)
                                 Image(systemName: "checkmark")
                                     .fontWeight(.semibold)
                                     .foregroundStyle(.tint)
+                                    .scaleEffect(selected ? 1 : 0.6)
                                     .opacity(selected ? 1 : 0)
                                     .accessibilityHidden(true)
                             }
+                            .animation(PiMotion.snappy(reduceMotion), value: selected)
                             .frame(minHeight: 30)
                             .contentShape(Rectangle())
                         }

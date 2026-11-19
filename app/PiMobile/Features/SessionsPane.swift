@@ -5,6 +5,7 @@ import PiMobileCore
 struct SessionsPane: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let onSettings: () -> Void
     @State private var searchText = ""
     @FocusState private var searchIsFocused: Bool
@@ -16,13 +17,16 @@ struct SessionsPane: View {
                     workspace(usesVerticalToolbar: vertical)
                 } toolbar: {
                     ToolbarItem(placement: .topBarTrailing) {
-                        connectionMenu
+                        connectionMenu(compactIcon: true)
                     }
                     .axisBehavior(.verticalPreferred)
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button("设置", systemImage: "gearshape", action: onSettings)
-                            .labelStyle(.iconOnly)
-                            .accessibilityIdentifier("workspace-settings")
+                        Button("设置", systemImage: "gearshape") {
+                            PiHaptics.tap()
+                            onSettings()
+                        }
+                        .labelStyle(.iconOnly)
+                        .accessibilityIdentifier("workspace-settings")
                     }
                     .axisBehavior(.verticalPreferred)
                 }
@@ -44,22 +48,25 @@ struct SessionsPane: View {
             )
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    HStack(spacing: 12) {
+                    HStack(spacing: 10) {
                         PiWordmark()
                         Spacer()
                         if !usesVerticalToolbar {
-                            connectionMenu
-                            PiIconButton(systemName: "gearshape", action: onSettings)
-                                .accessibilityLabel("设置")
-                                .accessibilityIdentifier("workspace-settings")
+                            connectionMenu(compactIcon: false)
+                            PiIconButton(systemName: "gearshape") {
+                                PiHaptics.tap()
+                                onSettings()
+                            }
+                            .accessibilityLabel("设置")
+                            .accessibilityIdentifier("workspace-settings")
                         }
                     }
-                    .padding(.bottom, 16)
+                    .padding(.bottom, 18)
                     if columns {
                         HStack(alignment: .top, spacing: 28) {
                             VStack(alignment: .leading, spacing: 12) {
                                 searchField
-                                actionButtons
+                                actionButtons(fullWidth: true)
                             }
                             .frame(width: min(260, geometry.size.width * 0.28), alignment: .leading)
                             Divider()
@@ -67,7 +74,7 @@ struct SessionsPane: View {
                         }
                     } else {
                         workspaceActions
-                        sessions(includesSearch: true).padding(.top, 16)
+                        sessions(includesSearch: true).padding(.top, 20)
                     }
                 }
                 .padding(.horizontal, columns ? 40 : 22)
@@ -78,48 +85,125 @@ struct SessionsPane: View {
             }
             .scrollIndicators(.hidden)
             .scrollDismissesKeyboard(.interactively)
-            .refreshable { model.loadSessions() }
+            .refreshable {
+                PiHaptics.tap()
+                model.loadSessions()
+            }
         }
         .background(Theme.background())
     }
 
-    private var connectionMenu: some View {
+    private var connectionColor: Color {
+        switch model.connection {
+        case .paired: return Theme.success
+        case .running: return Theme.amber
+        case .connecting: return Theme.ocean
+        case .error: return Theme.coral
+        case .idle: return .secondary
+        }
+    }
+
+    private var connectionPulsing: Bool {
+        model.connection == .running || model.connection == .connecting
+    }
+
+    private func connectionMenu(compactIcon: Bool) -> some View {
         Menu {
             Label(statusText, systemImage: model.isConnected ? "lock.shield" : "wifi.slash")
-            Button("重新连接", systemImage: "arrow.clockwise") { model.reconnect() }
-            Button("刷新会话", systemImage: "arrow.triangle.2.circlepath") { model.loadSessions() }
+            Button("重新连接", systemImage: "arrow.clockwise") {
+                PiHaptics.tap()
+                model.reconnect()
+            }
+            Button("刷新会话", systemImage: "arrow.triangle.2.circlepath") {
+                PiHaptics.tap()
+                model.loadSessions()
+            }
         } label: {
-            Image(systemName: model.isConnected ? "link" : "link.badge.plus")
-                .appFont(.system(size: 17, weight: .semibold))
-                .frame(width: 44, height: 44)
+            if compactIcon {
+                Image(systemName: model.isConnected ? "link" : "link.badge.plus")
+                    .appFont(.system(size: 17, weight: .semibold))
+                    .overlay(alignment: .topTrailing) {
+                        StatusDot(color: connectionColor, size: 7, pulsing: connectionPulsing)
+                            .offset(x: 4, y: -3)
+                    }
+                    .frame(width: 44, height: 44)
+            } else {
+                HStack(spacing: 7) {
+                    StatusDot(color: connectionColor, size: 7, pulsing: connectionPulsing)
+                    Text(statusText)
+                        .appFont(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.textPrimary)
+                        .contentTransition(.opacity)
+                }
+                .padding(.horizontal, 12)
+                .frame(minHeight: 36)
+                .piGlassCard(radius: 18, interactive: true)
+                .animation(PiMotion.quickFade(reduceMotion), value: statusText)
+            }
         }
         .buttonStyle(.plain)
         .accessibilityLabel("连接状态：\(statusText)")
     }
 
+    private var hasCurrentSession: Bool {
+        model.selectedSessionPath != nil || model.selectedSessionTitle != nil || !model.messages.isEmpty || !model.draft.isEmpty
+    }
+
     private var workspaceActions: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(spacing: 20) { actionButtons }
-            VStack(alignment: .leading, spacing: 0) { actionButtons }
+            HStack(spacing: 12) { actionButtons(fullWidth: true) }
+            VStack(alignment: .leading, spacing: 10) { actionButtons(fullWidth: true) }
         }
     }
 
-    @ViewBuilder private var actionButtons: some View {
-        Button("新建会话", systemImage: "square.and.pencil") {
+    @ViewBuilder private func actionButtons(fullWidth: Bool) -> some View {
+        Button {
+            PiHaptics.tap()
             searchIsFocused = false
             model.newSession()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "square.and.pencil")
+                    .appFont(.subheadline.weight(.semibold))
+                Text("新建会话")
+                    .appFont(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Theme.onAccent)
+            .padding(.horizontal, 16)
+            .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: 46)
+            .background(Theme.ocean, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .opacity(!model.isConnected || model.isLoadingHistory ? 0.45 : 1)
         }
         .disabled(!model.isConnected || model.isLoadingHistory)
         .accessibilityIdentifier("workspace-new-session")
-        .frame(minHeight: 44)
-        if model.selectedSessionPath != nil || model.selectedSessionTitle != nil || !model.messages.isEmpty || !model.draft.isEmpty {
-            Button("继续会话", systemImage: "arrow.turn.down.right") {
+
+        if hasCurrentSession {
+            Button {
+                PiHaptics.tap()
                 searchIsFocused = false
                 model.focusComposer = false
                 model.showConversation = true
+            } label: {
+                HStack(spacing: 8) {
+                    if model.connection == .running {
+                        StatusDot(color: Theme.amber, size: 7, pulsing: true)
+                    } else {
+                        Image(systemName: "arrow.turn.down.right")
+                            .appFont(.subheadline.weight(.semibold))
+                            .foregroundStyle(Theme.ocean)
+                    }
+                    Text("继续会话")
+                        .appFont(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.textPrimary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 16)
+                .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: 46)
+                .piGlassCard(radius: 16, interactive: true)
             }
             .accessibilityIdentifier("workspace-continue-session")
-            .frame(minHeight: 44)
+            .transition(PiMotion.controlPopTransition)
         }
     }
 
@@ -201,21 +285,35 @@ struct PiSessionList: View {
 
     private func sessionRow(_ entry: PiSessionEntry) -> some View {
         let selected = model.selectedSessionPath == entry.path
+        let isRunningHere = selected && model.connection == .running
         let largeType = dynamicTypeSize.isAccessibilitySize
         let heading = largeType ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
             : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 8))
-        return Button { open(entry.path) } label: {
+        return Button {
+            PiHaptics.selection()
+            open(entry.path)
+        } label: {
             VStack(alignment: .leading, spacing: 6) {
                 heading {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        if selected {
+                    HStack(alignment: .center, spacing: 7) {
+                        if isRunningHere {
+                            StatusDot(color: Theme.amber, size: 7, pulsing: true)
+                                .accessibilityHidden(true)
+                        } else if selected {
                             Image(systemName: "checkmark.circle.fill").appFont(.caption)
                                 .foregroundStyle(Theme.ocean).accessibilityHidden(true)
                         }
                         Text(entry.title).appFont(.body.weight(.medium)).lineLimit(largeType ? nil : 2)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    if let modified = entry.modified {
+                    if isRunningHere {
+                        Text("工作中")
+                            .appFont(.caption2.weight(.semibold))
+                            .foregroundStyle(Theme.amber)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Theme.amber.opacity(0.14), in: Capsule())
+                    } else if let modified = entry.modified {
                         Text(modified, style: .relative).appFont(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -224,7 +322,7 @@ struct PiSessionList: View {
                 }
             }
             .multilineTextAlignment(.leading)
-            .padding(.vertical, 10)
+            .padding(.vertical, 11)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }

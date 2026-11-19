@@ -4,6 +4,7 @@ import UIKit
 
 struct PairingView: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var token = ""
     @State private var showScanner = false
 
@@ -76,9 +77,11 @@ struct PairingView: View {
                         .foregroundStyle(Theme.coral)
                         .padding(12)
                         .piGlassCard(radius: 16, tint: Theme.coral.opacity(0.12))
+                        .transition(PiMotion.bannerTransition)
                     }
                     Spacer(minLength: 40)
                 }
+                .animation(PiMotion.smooth(reduceMotion), value: model.errorMessage)
                 .padding(24)
             }
         }
@@ -95,6 +98,8 @@ struct PairingView: View {
 struct PairScanner: View {
     let onFound: (String) -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var scanProgress: CGFloat = 0
 
     var body: some View {
         ZStack {
@@ -106,16 +111,41 @@ struct PairScanner: View {
                         .appFont(.headline)
                         .foregroundStyle(Theme.textPrimary)
                     Spacer()
-                    PiIconButton(systemName: "xmark") { dismiss() }
+                    PiIconButton(systemName: "xmark") {
+                        PiHaptics.tap()
+                        dismiss()
+                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 16)
                 Spacer()
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .strokeBorder(Theme.mist.opacity(0.85), lineWidth: 2)
-                    .frame(width: 260, height: 260)
-                    .background(.black.opacity(0.18))
-                    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                ZStack {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(.black.opacity(0.18))
+                    if !reduceMotion {
+                        Rectangle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [.clear, Theme.ocean.opacity(0.8), .clear],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(height: 2.5)
+                            .shadow(color: Theme.ocean.opacity(0.75), radius: 6)
+                            .offset(y: -110 + scanProgress * 220)
+                    }
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(Theme.mist.opacity(0.85), lineWidth: 2)
+                }
+                .frame(width: 260, height: 260)
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .onAppear {
+                    guard !reduceMotion else { return }
+                    withAnimation(.easeInOut(duration: 2.1).repeatForever(autoreverses: true)) {
+                        scanProgress = 1
+                    }
+                }
                 Spacer()
                 Text("把 Mac 终端里的二维码放进框内；无法使用相机时，返回粘贴完整配对链接。")
                     .appFont(.footnote)
@@ -303,6 +333,7 @@ private final class ScannerViewController: UIViewController, AVCaptureMetadataOu
               let value = object.stringValue,
               !value.isEmpty else { return }
         didFindCode = true
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
         stopSession()
         onFound?(value)
     }

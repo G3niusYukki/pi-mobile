@@ -31,10 +31,12 @@ struct PiMobileLiveActivityWidget: Widget {
                         Image(systemName: context.state.phase.symbol)
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(phaseColor(context.state.phase))
+                            .symbolEffect(.pulse, isActive: context.state.phase == .running)
                         ElapsedText(since: context.attributes.startedAt)
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.6))
                             .monospacedDigit()
+                            .contentTransition(.numericText())
                     }
                     .padding(.horizontal, 8)
                     .frame(height: 24)
@@ -80,10 +82,12 @@ struct PiMobileLiveActivityWidget: Widget {
                         Text("\(context.state.approvalCount)")
                             .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(.orange)
+                            .contentTransition(.numericText())
                     } else {
                         Image(systemName: context.state.phase.symbol)
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(phaseColor(context.state.phase))
+                            .symbolEffect(.pulse, isActive: context.state.phase == .running)
                     }
                 }
             } minimal: {
@@ -120,6 +124,7 @@ private struct LockScreenCard: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
                     .monospacedDigit()
+                    .contentTransition(.numericText())
             }
 
             HStack(spacing: 8) {
@@ -173,6 +178,7 @@ private struct StatusPill: View {
         HStack(spacing: 4) {
             Image(systemName: phase.symbol)
                 .font(.system(size: 9.5, weight: .semibold))
+                .symbolEffect(.pulse, isActive: phase == .running)
             Text(text)
                 .font(.system(size: 11, weight: .semibold))
         }

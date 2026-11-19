@@ -5,6 +5,7 @@ import PiMobileCore
 
 struct ConversationScreen: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let onSettings: () -> Void
     @FocusState private var focused: Bool
     @State private var photoItem: PhotosPickerItem?
@@ -14,6 +15,20 @@ struct ConversationScreen: View {
     @State private var sidebarSearch = ""
     @State private var availableSize = CGSize(width: 390, height: 600)
     @State private var showsPairingReset = false
+    @State private var stopRingPulse = false
+    @Namespace private var composerGlassNS
+
+    private var toolStepCount: Int {
+        model.messages.reduce(0) { $0 + ($1.role == .tool ? 1 : 0) }
+    }
+
+    private var bannerStateKey: String {
+        if model.needsRepair { return "repair" }
+        if let notice = model.pendingDeliveryNotice { return "notice:\(notice)" }
+        if let error = model.errorMessage { return "error:\(error)" }
+        if !model.isConnected { return "offline:\(model.connection.rawValue)" }
+        return "none"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -76,21 +91,43 @@ struct ConversationScreen: View {
         Menu {
             Picker("查看", selection: $tab) {
                 Text("对话").tag(ConversationTab.chat)
-                Text("轨迹").tag(ConversationTab.trace)
+                Text(toolStepCount > 0 ? "轨迹（\(toolStepCount)）" : "轨迹").tag(ConversationTab.trace)
             }
         } label: {
-            HStack(spacing: 5) {
+            HStack(spacing: 6) {
+                if model.connection == .running {
+                    StatusDot(color: Theme.ocean, size: 7, pulsing: true)
+                        .transition(.scale.combined(with: .opacity))
+                }
                 Text(tab == .trace ? "工具轨迹" : model.selectedSessionTitle ?? "Pi")
-                    .appFont(.headline).lineLimit(1)
-                Image(systemName: "chevron.down").appFont(.caption2)
+                    .appFont(.headline)
+                    .lineLimit(1)
+                    .contentTransition(.opacity)
+                if tab == .chat, toolStepCount > 0 {
+                    Text("\(toolStepCount)")
+                        .appFont(.caption2.weight(.semibold))
+                        .foregroundStyle(Theme.ocean)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Theme.ocean.opacity(0.12), in: Capsule())
+                        .contentTransition(.numericText())
+                        .transition(.scale.combined(with: .opacity))
+                }
+                Image(systemName: "chevron.down")
+                    .appFont(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
             }
             .foregroundStyle(.primary)
+            .animation(PiMotion.snappy(reduceMotion), value: model.connection == .running)
+            .animation(PiMotion.snappy(reduceMotion), value: toolStepCount)
+            .animation(PiMotion.quickFade(reduceMotion), value: tab)
         }
         .accessibilityLabel("\(model.selectedSessionTitle ?? "Pi")，切换对话或轨迹")
     }
 
     private var sidebarButton: some View {
         Button {
+            PiHaptics.tap()
             focused = false
             showsSidebar.toggle()
             if showsSidebar { model.loadSessions() }
@@ -162,64 +199,98 @@ struct ConversationScreen: View {
         .accessibilityLabel("会话操作")
     }
 
-    @ViewBuilder
     private var banners: some View {
-        if model.needsRepair {
-            actionBanner(
-                icon: "key.fill",
-                text: "网关密钥已更新，请重新扫码配对",
-                actionTitle: "重新配对",
-                action: { showsPairingReset = true }
-            )
-        } else if let notice = model.pendingDeliveryNotice {
-            actionBanner(icon: "clock", text: notice, actionTitle: "关闭", tint: Theme.textSecondary, action: model.clearError)
-        } else if let notice = model.pendingDeliveryNotice {
-            actionBanner(icon: "clock", text: notice, actionTitle: "关闭", tint: Theme.textSecondary,
-                         action: { model.clearError() })
-        } else if let error = model.errorMessage {
-            actionBanner(
-                icon: "exclamationmark.triangle.fill",
-                text: error,
-                actionTitle: "关闭",
-                action: { model.clearError() }
-            )
-        } else if !model.isConnected {
-            HStack(spacing: 8) {
-                if model.connection == .connecting {
-                    ProgressView().controlSize(.small).tint(Theme.ocean)
-                } else {
-                    Image(systemName: "wifi.slash")
+        Group {
+            if model.needsRepair {
+                actionBanner(
+                    icon: "key.fill",
+                    text: "网关密钥已更新，请重新扫码配对",
+                    actionTitle: "重新配对",
+                    action: { showsPairingReset = true }
+                )
+                .transition(PiMotion.bannerTransition)
+            } else if let notice = model.pendingDeliveryNotice {
+                actionBanner(
+                    icon: "clock",
+                    text: notice,
+                    actionTitle: "关闭",
+                    tint: Theme.textSecondary,
+                    action: { model.clearError() }
+                )
+                .transition(PiMotion.bannerTransition)
+            } else if let error = model.errorMessage {
+                actionBanner(
+                    icon: "exclamationmark.triangle.fill",
+                    text: error,
+                    actionTitle: "关闭",
+                    action: { model.clearError() }
+                )
+                .transition(PiMotion.bannerTransition)
+            } else if !model.isConnected {
+                HStack(spacing: 9) {
+                    if model.connection == .connecting {
+                        StatusDot(color: Theme.ocean, size: 7, pulsing: true)
+                    } else {
+                        Image(systemName: "wifi.slash")
+                            .foregroundStyle(Theme.coral)
+                    }
+                    if model.connection == .connecting {
+                        PiShimmerText(text: "正在连接 Mac…", font: .caption.weight(.medium))
+                    } else {
+                        Text("未连接到 Mac")
+                            .appFont(.caption.weight(.medium))
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                    Spacer()
+                    if model.connection != .connecting {
+                        Button("重新连接") {
+                            PiHaptics.tap()
+                            model.reconnect()
+                        }
+                        .appFont(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.ocean)
+                    }
                 }
-                Text(model.connection == .connecting ? "正在连接 Mac…" : "未连接到 Mac")
-                Spacer()
-                if model.connection != .connecting {
-                    Button("重新连接") { model.reconnect() }
-                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Theme.cardStroke.opacity(0.6), lineWidth: 0.75)
+                )
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+                .transition(PiMotion.bannerTransition)
             }
-            .appFont(.caption)
-            .foregroundStyle(Theme.textSecondary)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .padding(.horizontal, 14)
-            .padding(.bottom, 6)
         }
+        .animation(PiMotion.smooth(reduceMotion), value: bannerStateKey)
     }
 
     private func actionBanner(icon: String, text: String, actionTitle: String, tint: Color = Theme.coral,
                               action: @escaping () -> Void) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 9) {
             Image(systemName: icon)
             Text(text)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer()
-            Button(actionTitle) { action() }
-                .appFont(.caption.weight(.semibold))
+            Button(actionTitle) {
+                PiHaptics.tap()
+                action()
+            }
+            .appFont(.caption.weight(.semibold))
         }
         .appFont(.caption)
         .foregroundStyle(tint)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(Color(uiColor: .secondarySystemBackground))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(tint == Theme.coral ? Theme.coral.opacity(0.10) : Theme.cardFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder((tint == Theme.coral ? Theme.coral : Theme.cardStroke).opacity(0.28), lineWidth: 0.75)
+        )
         .padding(.horizontal, 14)
         .padding(.bottom, 6)
     }
@@ -228,27 +299,35 @@ struct ConversationScreen: View {
 
     private var content: some View {
         let rows = tab.rows(in: model.messages)
+        let activityLabel = tab == .chat && !model.isLoadingHistory
+            ? ConversationTab.activityLabel(in: model.messages, connection: model.connection, phase: model.runPhase)
+            : nil
         return VStack(spacing: 0) {
             if model.isLoadingHistory {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("正在加载会话…")
+                HStack(spacing: 9) {
+                    StatusDot(color: Theme.ocean, size: 7, pulsing: true)
+                    PiShimmerText(text: "正在加载会话…", font: .caption.weight(.medium))
                     Spacer()
                 }
-                .appFont(.caption)
-                .foregroundStyle(.secondary)
                 .padding(.horizontal, 20)
                 .padding(.vertical, 8)
+                .transition(PiMotion.bannerTransition)
             }
             ConversationTimeline(storageKey: timelineKey, messageIDs: rows.map(\.id), isLoading: model.isLoadingHistory,
+                                 isRunning: model.connection == .running,
                                  submittedPromptID: tab == .chat ? model.submittedPromptID : nil) {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if rows.isEmpty, !model.isLoadingHistory {
                         if tab == .trace {
                             Label("暂无工具调用", systemImage: "wrench.and.screwdriver")
-                                .appFont(.subheadline).foregroundStyle(.secondary).padding(.vertical, 16)
+                                .appFont(.subheadline).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 160)
                         } else if model.connection != .running, model.errorMessage == nil {
-                            EmptyConversationView()
+                            EmptyConversationView { prompt in
+                                PiHaptics.selection()
+                                model.draft = prompt
+                                focused = true
+                            }
                         }
                     }
                     ForEach(rows) { row in
@@ -260,18 +339,24 @@ struct ConversationScreen: View {
                         }
                     }
                     if tab == .chat {
-                        if let approval = model.approvals.first {
-                            ApprovalCard(request: approval) { model.answer(approval, confirmed: $0) }
+                        Group {
+                            if let approval = model.approvals.first {
+                                ApprovalCard(request: approval) { confirmed in
+                                    if confirmed { PiHaptics.success() } else { PiHaptics.stop() }
+                                    model.answer(approval, confirmed: confirmed)
+                                }
                                 .reservedRegionAware()
-                        } else if !model.isLoadingHistory, let label = ConversationTab.activityLabel(in: model.messages, connection: model.connection, phase: model.runPhase) {
-                            HStack(spacing: 8) {
-                                ProgressView().controlSize(.mini).accessibilityHidden(true)
-                                Text(label).appFont(.footnote)
+                                .transition(PiMotion.cardRiseTransition)
+                                .sensoryFeedback(.warning, trigger: approval.id)
+                            } else if let label = activityLabel {
+                                PiThinkingIndicator(label: label)
+                                    .padding(.vertical, 4)
+                                    .accessibilityElement(children: .combine)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .leading)))
                             }
-                            .padding(.vertical, 4)
-                            .foregroundStyle(.secondary)
-                            .accessibilityElement(children: .combine)
                         }
+                        .animation(PiMotion.smooth(reduceMotion), value: model.approvals.first?.id)
+                        .animation(PiMotion.quickFade(reduceMotion), value: activityLabel)
                     }
                 }
                 .padding(.top, 8)
@@ -289,51 +374,109 @@ struct ConversationScreen: View {
         "\(model.selectedSessionPath ?? model.conversationID.uuidString):\(tab)"
     }
 
-    // MARK: - 输入区
+    // MARK: - 输入区（iOS 26 液态玻璃变形输入栏）
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 4) {
-            attachmentButton
-            TextField("给 Pi 发消息", text: $model.draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .appFont(.body)
-                .foregroundStyle(.primary)
-                .focused($focused)
-                .lineLimit(1...5)
-                .padding(.vertical, 9)
-                .frame(minHeight: 44, alignment: .leading)
-                .accessibilityIdentifier("composer-input")
-            if focused {
-                Button { focused = false } label: {
-                    Image(systemName: "keyboard.chevron.compact.down").frame(width: 44, height: 44)
+        GlassEffectContainer(spacing: 8) {
+            HStack(alignment: .bottom, spacing: 4) {
+                attachmentButton
+                TextField(model.connection == .running ? "补充指令给 Pi…" : "给 Pi 发消息", text: $model.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .appFont(.body)
+                    .foregroundStyle(.primary)
+                    .focused($focused)
+                    .lineLimit(1...5)
+                    .padding(.vertical, 9)
+                    .frame(minHeight: 44, alignment: .leading)
+                    .accessibilityIdentifier("composer-input")
+
+                Group {
+                    if focused {
+                        Button {
+                            PiHaptics.tap()
+                            focused = false
+                        } label: {
+                            Image(systemName: "keyboard.chevron.compact.down")
+                                .appFont(.system(size: 16, weight: .medium))
+                                .frame(width: 44, height: 44)
+                        }
+                        .accessibilityLabel("收起键盘")
+                        .transition(PiMotion.controlPopTransition)
+                    } else {
+                        modelControl
+                            .transition(PiMotion.controlPopTransition)
+                    }
                 }
-                .accessibilityLabel("收起键盘")
-            } else { modelControl }
-            Button {
-                if showsStopButton { model.stop() }
-                else if model.send() { focused = false }
-            } label: {
-                Image(systemName: showsStopButton ? "stop.fill" : "arrow.up")
-                    .appFont(.system(size: showsStopButton ? 13 : 16, weight: .bold))
-                    .foregroundStyle(actionEnabled ? .white : Color.secondary)
-                    .frame(width: 32, height: 32)
-                    .background(actionEnabled ? Theme.ocean : Color(uiColor: .tertiarySystemFill), in: Circle())
-                    .frame(width: 44, height: 44)
+                .animation(PiMotion.snappy(reduceMotion), value: focused)
+
+                composerActionButton
+                    .animation(PiMotion.snappy(reduceMotion), value: showsStopButton)
+                    .animation(PiMotion.snappy(reduceMotion), value: actionEnabled)
             }
-            .accessibilityLabel(showsStopButton ? "停止生成" : model.connection == .running ? "发送补充消息" : "发送消息")
-            .accessibilityIdentifier("composer-action")
-            .disabled(!actionEnabled)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 24))
+            .glassEffectID("composer-capsule", in: composerGlassNS)
         }
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 5)
-        .padding(.vertical, 3)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 22))
         .padding(.horizontal, 14)
-        .padding(.top, 4)
-        .padding(.bottom, 6)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
         .frame(maxWidth: PiAdaptiveLayout.pageWidth)
         .frame(maxWidth: .infinity)
         .reservedRegionAware()
+    }
+
+    private var composerActionButton: some View {
+        Button {
+            if showsStopButton {
+                PiHaptics.stop()
+                model.stop()
+            } else if model.send() {
+                PiHaptics.send()
+                focused = false
+            }
+        } label: {
+            ZStack {
+                if showsStopButton, !reduceMotion {
+                    Circle()
+                        .stroke(Theme.ocean.opacity(0.45), lineWidth: 1.8)
+                        .frame(width: 34, height: 34)
+                        .scaleEffect(stopRingPulse ? 1.24 : 0.96)
+                        .opacity(stopRingPulse ? 0 : 0.75)
+                }
+
+                Circle()
+                    .fill(actionButtonBackground)
+                    .frame(width: 34, height: 34)
+
+                Image(systemName: showsStopButton ? "stop.fill" : "arrow.up")
+                    .appFont(.system(size: showsStopButton ? 12.5 : 15.5, weight: .bold))
+                    .foregroundStyle(actionEnabled ? .white : Color.secondary)
+                    .contentTransition(.symbolEffect(.replace.downUp))
+            }
+            .scaleEffect(actionEnabled ? 1.0 : 0.92)
+            .frame(width: 44, height: 44)
+        }
+        .accessibilityLabel(showsStopButton ? "停止生成" : model.connection == .running ? "发送补充消息" : "发送消息")
+        .accessibilityIdentifier("composer-action")
+        .disabled(!actionEnabled)
+        .onAppear { syncStopPulse() }
+        .onChange(of: showsStopButton) { _, _ in syncStopPulse() }
+        .onChange(of: reduceMotion) { _, _ in syncStopPulse() }
+    }
+
+    private var actionButtonBackground: Color {
+        if showsStopButton { return Theme.ocean }
+        return actionEnabled ? Theme.ocean : Color(uiColor: .tertiarySystemFill)
+    }
+
+    private func syncStopPulse() {
+        stopRingPulse = false
+        guard showsStopButton, !reduceMotion else { return }
+        withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) {
+            stopRingPulse = true
+        }
     }
 
     private var actionEnabled: Bool {
@@ -377,7 +520,10 @@ struct ConversationScreen: View {
         Menu {
             Menu("模型") {
                 ForEach(model.models) { option in
-                    Button { model.chooseModel(option) } label: {
+                    Button {
+                        PiHaptics.selection()
+                        model.chooseModel(option)
+                    } label: {
                         if model.selectedModel == option.id {
                             Label(option.displayName, systemImage: "checkmark")
                         } else {
@@ -389,7 +535,10 @@ struct ConversationScreen: View {
             .disabled(model.models.isEmpty)
             Menu("思考强度") {
                 ForEach(PiThinkingLevel.choices, id: \.self) { level in
-                    Button { model.setThinking(level) } label: {
+                    Button {
+                        PiHaptics.selection()
+                        model.setThinking(level)
+                    } label: {
                         if model.thinking == level {
                             Label(PiThinkingLevel.title(level), systemImage: "checkmark")
                         } else {
@@ -424,6 +573,14 @@ struct ConversationScreen: View {
 
 private struct MessageBubble: View {
     let message: ChatMessage
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var userBubbleFill: Color {
+        colorScheme == .dark
+            ? Theme.ocean.opacity(0.22)
+            : Theme.ocean.opacity(0.10)
+    }
 
     var body: some View {
         Group {
@@ -433,21 +590,47 @@ private struct MessageBubble: View {
                         ChatPhotoView(attachment: attachment)
                     }
                     if !message.text.isEmpty {
-                        Text(message.text).textSelection(.enabled).appFont(.body)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 15))
+                        Text(message.text)
+                            .textSelection(.enabled)
+                            .appFont(.body)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .background(
+                                userBubbleFill,
+                                in: UnevenRoundedRectangle(
+                                    topLeadingRadius: 18,
+                                    bottomLeadingRadius: 18,
+                                    bottomTrailingRadius: 6,
+                                    topTrailingRadius: 18,
+                                    style: .continuous
+                                )
+                            )
                     }
                 }
                 .padding(.leading, 34)
                 .frame(maxWidth: .infinity, alignment: .trailing)
             } else {
-                MarkdownLiteText(markdown: message.text, streaming: message.streaming)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 4) {
+                    MarkdownLiteText(markdown: message.text, streaming: message.streaming)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if !message.streaming, !message.text.isEmpty {
+                        HStack(spacing: 4) {
+                            PiCopyButton(text: message.text, title: "复制", compact: true)
+                            Spacer()
+                        }
+                        .padding(.leading, -8)
+                        .transition(.opacity)
+                    }
+                }
+                .animation(PiMotion.quickFade(reduceMotion), value: message.streaming)
             }
         }
         .contextMenu {
             if !message.text.isEmpty {
-                Button("复制全文", systemImage: "doc.on.doc") { UIPasteboard.general.string = message.text }
+                Button("复制全文", systemImage: "doc.on.doc") {
+                    UIPasteboard.general.string = message.text
+                    PiHaptics.success()
+                }
             }
         }
         .padding(.vertical, 4)
@@ -459,36 +642,143 @@ private struct ApprovalCard: View {
     let answer: (Bool) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(request.title, systemImage: "hand.raised.fill")
-                .appFont(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.textPrimary)
-            if let detail = request.detail {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "hand.raised.fill")
+                    .appFont(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.amber)
+                    .frame(width: 28, height: 28)
+                    .background(Theme.amber.opacity(0.16), in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("需要确认")
+                        .appFont(.caption2.weight(.semibold))
+                        .foregroundStyle(Theme.amber)
+                    Text(request.title)
+                        .appFont(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.textPrimary)
+                }
+            }
+
+            if let detail = request.detail, !detail.isEmpty {
                 Text(detail)
-                    .appFont(.caption)
+                    .appFont(.system(size: 12.5, design: .monospaced))
                     .foregroundStyle(Theme.textSecondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
+
             HStack(spacing: 10) {
-                Button("拒绝") { answer(false) }
-                    .frame(maxWidth: .infinity)
-                Button("允许") { answer(true) }
-                    .frame(maxWidth: .infinity)
+                Button {
+                    answer(false)
+                } label: {
+                    Text("拒绝")
+                        .appFont(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.textPrimary)
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 42)
+                        .background(Theme.cardFillStrong, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Theme.cardStroke, lineWidth: 0.75))
+                }
+                .buttonStyle(bouncy())
+
+                Button {
+                    answer(true)
+                } label: {
+                    Text("允许")
+                        .appFont(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 42)
+                        .background(Theme.ocean, in: Capsule())
+                }
+                .buttonStyle(bouncy())
             }
-            .appFont(.subheadline.weight(.semibold))
-            .foregroundStyle(Theme.textPrimary)
-            .padding(.vertical, 10)
-            .buttonStyle(.bordered)
         }
         .padding(14)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(Theme.amber.opacity(0.45), lineWidth: 1)
+        )
     }
 }
 
 private struct EmptyConversationView: View {
+    let onPrompt: (String) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var appeared = false
+
+    private let suggestions = [
+        ("doc.text.magnifyingglass", "检查当前仓库状态与最近改动"),
+        ("wrench.and.screwdriver", "运行测试并定位失败原因"),
+        ("list.bullet.clipboard", "帮我梳理接下来的实现计划"),
+    ]
+
     var body: some View {
-        Text("还没有消息")
-            .appFont(.body)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, minHeight: 160)
+        VStack(spacing: 18) {
+            ZStack {
+                Circle()
+                    .fill(Theme.ocean.opacity(0.12))
+                    .frame(width: 72, height: 72)
+                    .blur(radius: 10)
+                PiMark(size: 48)
+            }
+
+            VStack(spacing: 6) {
+                Text("Pi 已就绪")
+                    .appFont(.title3.bold())
+                    .foregroundStyle(Theme.textPrimary)
+                Text("在手机上继续 Mac 会话，实时查看工具进度与代码改动。")
+                    .appFont(.subheadline)
+                    .foregroundStyle(Theme.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 20)
+            }
+
+            VStack(spacing: 8) {
+                ForEach(suggestions, id: \.1) { icon, prompt in
+                    Button {
+                        onPrompt(prompt)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: icon)
+                                .appFont(.footnote.weight(.semibold))
+                                .foregroundStyle(Theme.ocean)
+                                .frame(width: 20)
+                            Text(prompt)
+                                .appFont(.subheadline)
+                                .foregroundStyle(Theme.textPrimary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Image(systemName: "arrow.up.right")
+                                .appFont(.caption2.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 11)
+                        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(Theme.cardStroke.opacity(0.55), lineWidth: 0.75)
+                        )
+                    }
+                    .buttonStyle(bouncy())
+                }
+            }
+            .frame(maxWidth: 420)
+        }
+        .padding(.vertical, 32)
+        .frame(maxWidth: .infinity)
+        .opacity(appeared ? 1 : 0)
+        .offset(y: appeared || reduceMotion ? 0 : 10)
+        .onAppear {
+            withAnimation(PiMotion.gentle(reduceMotion)) {
+                appeared = true
+            }
+        }
     }
 }

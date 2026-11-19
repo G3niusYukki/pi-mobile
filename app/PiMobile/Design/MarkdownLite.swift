@@ -43,10 +43,7 @@ struct MarkdownLiteText: View {
                 }
             }
             if streaming {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(Theme.ocean)
-                    .accessibilityLabel("Pi 正在回复")
+                PiStreamingCursor()
                     .padding(.top, 2)
             }
         }
@@ -207,33 +204,112 @@ struct CodeBlockView: View {
     let code: String
     let lang: String?
 
+    private var isDiff: Bool {
+        if let lang, ["diff", "patch"].contains(lang.lowercased()) { return true }
+        let lines = code.components(separatedBy: "\n")
+        let hasHunk = lines.contains { $0.hasPrefix("@@ ") }
+        let hasAdd = lines.contains { $0.hasPrefix("+") && !$0.hasPrefix("+++") }
+        let hasDel = lines.contains { $0.hasPrefix("-") && !$0.hasPrefix("---") }
+        return hasHunk || (hasAdd && hasDel)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(lang?.uppercased() ?? "代码")
-                    .appFont(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Theme.textTertiary)
+            HStack(spacing: 8) {
+                HStack(spacing: 5) {
+                    Image(systemName: isDiff ? "plus.forwardslash.minus" : "chevron.left.forwardslash.chevron.right")
+                        .appFont(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(isDiff ? Theme.ocean : Theme.textTertiary)
+                        .accessibilityHidden(true)
+                    Text(lang?.uppercased() ?? (isDiff ? "DIFF" : "代码"))
+                        .appFont(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                }
                 Spacer()
-                PiCopyButton(text: code, title: "复制代码")
+                PiCopyButton(text: code, title: "复制代码", compact: true)
             }
-            .padding(.horizontal, 12)
+            .padding(.leading, 12)
+            .padding(.trailing, 4)
+            .padding(.vertical, 2)
+            .background(Theme.cardFill)
+
+            Rectangle()
+                .fill(Theme.cardStroke.opacity(0.6))
+                .frame(height: 0.5)
+
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(code)
-                    .appFont(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(Theme.textPrimary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, lang == nil ? 12 : 4)
-                    .padding(.bottom, lang == nil ? 0 : 10)
+                if isDiff {
+                    DiffCodeContent(code: code)
+                        .padding(.vertical, 10)
+                } else {
+                    Text(code)
+                        .appFont(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(Theme.textPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Theme.cardFillStrong)
+                .fill(Theme.cardFill)
         )
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Theme.cardFill, lineWidth: 1)
+                .strokeBorder(Theme.cardStroke.opacity(0.7), lineWidth: 0.75)
         )
+    }
+}
+
+struct DiffCodeContent: View {
+    let code: String
+
+    var body: some View {
+        let lines = code.components(separatedBy: "\n")
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                let kind = LineKind(line)
+                Text(line.isEmpty ? " " : line)
+                    .appFont(.system(size: 12.5, design: .monospaced))
+                    .foregroundStyle(kind.foreground)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 1.5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(kind.background)
+            }
+        }
+    }
+
+    private enum LineKind {
+        case added, removed, hunk, meta, context
+
+        init(_ line: String) {
+            if line.hasPrefix("@@ ") { self = .hunk }
+            else if line.hasPrefix("+++") || line.hasPrefix("---") { self = .meta }
+            else if line.hasPrefix("+") { self = .added }
+            else if line.hasPrefix("-") { self = .removed }
+            else { self = .context }
+        }
+
+        var foreground: Color {
+            switch self {
+            case .added: Theme.success
+            case .removed: Theme.coral
+            case .hunk: Theme.ocean
+            case .meta: Theme.textSecondary
+            case .context: Theme.textPrimary
+            }
+        }
+
+        var background: Color {
+            switch self {
+            case .added: Theme.success.opacity(0.11)
+            case .removed: Theme.coral.opacity(0.11)
+            case .hunk: Theme.ocean.opacity(0.09)
+            case .meta, .context: .clear
+            }
+        }
     }
 }

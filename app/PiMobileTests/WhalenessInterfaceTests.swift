@@ -157,6 +157,11 @@ final class WhalenessInterfaceTests: XCTestCase {
         let block = ToolStepGroup(steps: [second, tool])
         XCTAssertEqual(block.headline, "正在读取文件")
         XCTAssertEqual(block.detail, "1/2 已完成")
+        XCTAssertEqual(block.activeToolSymbol, "doc.text")
+        XCTAssertEqual(block.livePreviewText, "2 条记录")
+        XCTAssertEqual(ToolStepGroup.symbol(for: ChatMessage(role: .tool, text: "", toolTitle: "bash")), "terminal")
+        XCTAssertEqual(ToolStepGroup.symbol(for: ChatMessage(role: .tool, text: "", toolTitle: "edit")), "pencil.line")
+        XCTAssertNil(PiMotion.quickFade(true))
     }
 
     func testWorkspaceAdaptsToDuoAndAccessibilitySizes() {
