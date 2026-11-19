@@ -6,11 +6,11 @@ Pi Mobile 让你在 iPhone 上继续 Mac 上的 pi 会话，查看工具结果�
 iPhone App ←─ WSS ─→ relay ←─ WSS ─→ Mac gateway ←─ JSONL ─→ pi
 ```
 
-## 安装 0.1.1
+## 安装 0.1.2
 
-iPhone 需要 iOS 26.0 或更高版本。从 [v0.1.1 发布页](https://github.com/G3niusYukki/pi-mobile/releases/tag/v0.1.1) 下载未签名 IPA（构建 4）和 `SHA256SUMS.txt`，在下载目录运行 `shasum -a 256 -c SHA256SUMS.txt` 校验安装包。真机安装前，请用自己的 Apple 签名证书和描述文件为主 App 和内嵌的实时活动扩展签名。
+iPhone 需要 iOS 26.0 或更高版本。从 [v0.1.2 发布页](https://github.com/G3niusYukki/pi-mobile/releases/tag/v0.1.2) 下载未签名 IPA（构建 7）和 `SHA256SUMS.txt`，在下载目录运行 `shasum -a 256 -c SHA256SUMS.txt` 校验安装包。真机安装前，请用自己的 Apple 签名证书和描述文件为主 App 和内嵌的实时活动扩展签名。
 
-从 0.1.0 升级时，请沿用原签名团队和 Bundle ID，覆盖安装以保留配对。将 Mac 网关更新到同一版本并重启网关，即可使用工具进度和历史图片预览。首次安装请按下文连接自己的 relay 和 Mac 网关。
+从 0.1.0 或 0.1.1 升级时，请沿用原签名团队和 Bundle ID，覆盖安装以保留配对。将 Mac 网关更新到同一版本并重启网关，即可使用断线回执核对与恢复能力。首次安装请按下文连接自己的 relay 和 Mac 网关。
 
 ## 自托管与配对
 
